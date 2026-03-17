@@ -1,0 +1,1 @@
+timestamp_ms,elapsed_s,raw_line,state,pot,vbus,duty,step,tp,zc_count,synced,missed,bemf_a,bemf_b,bemf_c,dc1,io1,io2,io3,ic_accepted,ic_false,ic_captures,ic_chatter,tp_hr,zc_interval,zc_interval_hr,prev_zc_interval,ic_phase,forced_steps,erpm,duty_pct_x10,fault_code,d_ic_accepted,d_ic_false,d_ic_captures,d_ic_chatter,ic_accept_rate,ic_false_rate
