@@ -1,21 +1,9 @@
 # MPLAB X build artifacts
 build/
 dist/
-debug/
 .generated_files/
 
-# IDE private settings (user-specific paths/debugger)
+# MPLAB X user-specific files (regenerated per-machine)
 nbproject/private/
-
-# Log files
-defmplabxtrace.log
-defmplabxtrace.log.inx
-queuelogs/
-
-# Python
-__pycache__/
-*.pyc
-
-# OS
-.DS_Store
-Thumbs.db
+nbproject/Makefile-local-default.mk
+nbproject/Makefile-genesis.properties

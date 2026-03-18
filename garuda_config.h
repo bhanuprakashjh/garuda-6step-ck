@@ -32,6 +32,24 @@
  * is minimal. Reference firmware uses 0x14 = 20 counts = 50ns. */
 #define DEADTIME_TCY        0x14U
 
+/* ── Current Sensing (EV43F54A inverter board) ─────────────────────── */
+/* Shunt: RS1/RS2/RS3 = 3mΩ (0.003R) on each phase + DC bus return.
+ * Phase A (IS1): dsPIC OA2, Gt = 1 + R46/(R57+R58) = 1+12k/800 = 16
+ * Phase B (IS2): dsPIC OA3, same topology, Gt = 16
+ * DC Bus (IBus): ATA6847 OPO3 Gt=8 → dsPIC OA1
+ * ADC: 12-bit signed fractional, 3.3V ref → ±1.65V range after offset.
+ * ADC is 12-bit signed fractional (left-justified in 16-bit: /65536 not /4096)
+ * Phase current: V = raw × 3.3 / 65536, I = V / (0.003 × 16)
+ *   → I_mA = raw × 3300 / 65536 / 0.048 = raw × 1.049
+ * Bus current:   V = raw × 3.3 / 65536, I = V / (0.003 × 8)
+ *   → I_mA = raw × 3300 / 65536 / 0.024 = raw × 2.098 */
+#define CURRENT_SHUNT_MOHM      3U      /* 3mΩ shunt resistors */
+#define CURRENT_PHASE_GAIN      16U     /* OA2/OA3 gain for phase currents */
+#define CURRENT_IBUS_GAIN       16U     /* ATA6847 CSA3 gain (CSCR.GAIN=0b01=Gain_16)
+                                         * Note: dsPIC OA1 is NOT used (OA1IN- shares
+                                         * pin with AN9/Vbus). AN0 reads CSA3 output
+                                         * directly through RC filter. */
+
 /* ── Timer1 (50 µs tick) ───────────────────────────────────────────── */
 #define TIMER1_PRESCALE     8U
 #define TIMER1_FREQ_HZ      20000U       /* 50 µs period — matches ADC ISR rate */
@@ -73,6 +91,13 @@
 #define MAX_CLOSED_LOOP_ERPM 15000U      /* ~3000 mech RPM */
 #define RAMP_TARGET_ERPM     3000U       /* OL→CL handoff speed */
 #define CL_IDLE_DUTY_PERCENT 8U          /* Minimum duty in CL (idle floor) */
+
+/* ATA6847 Hardware Current Limit — cycle-by-cycle chopping.
+ * DAC formula: VILIM_TH = 3.3V × DAC / 128
+ * Trip current: I = (VILIM_TH - 1.65V) / (Gain × Rshunt)
+ *             = (3.3 × DAC / 128 - 1.65) / (16 × 0.003)
+ * Hurst rated 3.4A, max 5A. DAC=80 → 8.6A trip (2.5× rated). */
+#define ILIM_DAC            80U     /* 8.6A trip for Hurst */
 
 /* Vbus Fault Thresholds (24V system) */
 #define VBUS_OV_THRESHOLD   (3200U * 16U)  /* ~30V → 51200 in 16-bit */
@@ -140,6 +165,12 @@
                                           * Tp:2 = 100k eRPM. Below Tp:2, Timer1 quantization
                                           * is too coarse; HR timing handles sub-tick precision. */
 #define RAMP_TARGET_ERPM     4000U       /* OL→CL handoff speed (~571 mech RPM) */
+/* ATA6847 Hardware Current Limit — cycle-by-cycle chopping.
+ * TEST VALUE: DAC=75 → 5.3A peak trip. At ~50% duty, DC bus limit
+ * ≈ 2.6A — easily triggered on bench with prop.
+ * PRODUCTION: raise to DAC=95 (16.6A) for flight. */
+#define ILIM_DAC            85U     /* TEST: calibrating actual trip point */
+
 #define CL_IDLE_DUTY_PERCENT 10U         /* Higher idle for prop drag (10% of 12V) */
 
 /* Vbus Fault Thresholds (12V / 3S LiPo system)
@@ -173,6 +204,12 @@
 /* ── Feature Flags ─────────────────────────────────────────────────── */
 #ifndef FEATURE_IC_ZC
 #define FEATURE_IC_ZC           1   /* 1 = fast poll timer ZC, 0 = ADC ISR polling only */
+#endif
+
+#ifndef FEATURE_GSP
+#define FEATURE_GSP             0   /* 1 = GSP binary protocol on UART1 (disables debug prints)
+                                     * 0 = debug UART text output (default for development)
+                                     * Set to 1 when using GUI or gsp_ck_test.py */
 #endif
 
 /* ── SCCP1 Fast ZC Polling Timer (FEATURE_IC_ZC=1) ────────────────── */

@@ -141,6 +141,20 @@ typedef struct {
     uint8_t  desyncRestartAttempts;
     uint32_t recoveryCounter;
 
+    /* ATA6847 fault monitoring */
+    bool     ataFaultPending;       /* Set by Timer1 ISR when nIRQ asserted */
+    bool     ataIlimActive;         /* Set when ILIM chopping detected */
+    uint8_t  ataLastSIR1;           /* Last SIR1 value for diagnostics */
+
+    /* Current sensing (ADC, 20kHz PWM-center triggered, signed 12-bit fractional)
+     * Shunt: 3mΩ (RS1/RS2/RS3 on EV43F54A inverter sheet)
+     * Phase A (IS1): OA2 Gt=16 → AN1 (ADCBUF1)
+     * Phase B (IS2): OA3 Gt=16 → AN4 (ADCBUF4)
+     * DC Bus (IBus): ATA6847 OPO3 Gt=8 → OA1 → AN0 (ADCBUF0) */
+    int16_t  iaRaw;             /* Phase A current (AN1, OA2, signed) */
+    int16_t  ibRaw;             /* Phase B current (AN4, OA3, signed) */
+    int16_t  ibusRaw;           /* DC bus current  (AN0, OA1, signed) */
+
     /* Sub-structures */
     BEMF_STATE_T   bemf;
     TIMING_STATE_T timing;

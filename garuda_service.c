@@ -297,6 +297,61 @@ void GarudaService_MainLoop(void)
         HAL_ATA6847_EnterGduStandby();
     }
 
+    /* ATA6847 fault decode — nIRQ was asserted, read SIR1 via SPI.
+     * The ATA6847 has already taken protective action (chopping or shutdown)
+     * before we get here. We just need to decode and respond. */
+    if (gData.ataFaultPending)
+    {
+        gData.ataFaultPending = false;
+        uint8_t sir1 = HAL_ATA6847_ReadReg(ATA_SIR1);
+        gData.ataLastSIR1 = sir1;
+
+        if (sir1 & 0x10)  /* ILIM — current limit chopping */
+        {
+            /* Informational: motor is running at current limit.
+             * Don't stop — chopping mode keeps motor safe. Log it. */
+            gData.ataIlimActive = true;
+            /* Clear the ILIM flag */
+            HAL_ATA6847_WriteReg(ATA_SIR1, 0x10);
+        }
+
+        if (sir1 & 0x02)  /* VDSSC — VDS short circuit */
+        {
+            /* Critical: a MOSFET has desaturated. GDU already shut down. */
+            uint8_t sir3 = HAL_ATA6847_ReadReg(ATA_SIR3);
+            HAL_UART_WriteString("\r\n!ATA SC:");
+            HAL_UART_WriteHex8(sir3);
+            HAL_UART_NewLine();
+            HAL_ATA6847_ClearFaults();
+            EnterFault(FAULT_ATA6847);
+        }
+
+        if (sir1 & 0x04)  /* OVTF — over-temperature */
+        {
+            HAL_UART_WriteString("\r\n!ATA OVT\r\n");
+            HAL_ATA6847_ClearFaults();
+            EnterFault(FAULT_ATA6847);
+        }
+
+        if (sir1 & 0x80)  /* VSUPF — supply failure */
+        {
+            HAL_UART_WriteString("\r\n!ATA VSUP\r\n");
+            HAL_ATA6847_ClearFaults();
+            EnterFault(FAULT_ATA6847);
+        }
+
+        if (sir1 & 0x01)  /* VGSUV — gate under-voltage */
+        {
+            HAL_UART_WriteString("\r\n!ATA VGSUV\r\n");
+            HAL_ATA6847_ClearFaults();
+            EnterFault(FAULT_ATA6847);
+        }
+    }
+    else
+    {
+        gData.ataIlimActive = false;
+    }
+
     /* Fault state: auto-clear after deferred fault handler runs.
      * User can press BTN1 again to retry, or BTN2 to stop. */
     if (gData.state == ESC_FAULT)
@@ -321,6 +376,13 @@ void __attribute__((interrupt, auto_psv)) _T1Interrupt(void)
         tickDiv = 0;
         gData.systemTick++;
     }
+
+    /* ATA6847 nIRQ poll — active low when any enabled fault occurs.
+     * Latency: ≤50µs (one Timer1 tick). The ATA6847 has already taken
+     * protective action (gate chopping or shutdown) before we read this.
+     * Main loop decodes the specific fault via SPI. */
+    if (!nIRQ_GetValue() && gData.state >= ESC_OL_RAMP)
+        gData.ataFaultPending = true;
 
     switch (gData.state)
     {
@@ -531,13 +593,46 @@ void __attribute__((interrupt, auto_psv)) _ADCInterrupt(void)
     gData.potRaw = (uint16_t)ADCBUF_POT;    /* AN6 */
     gData.vbusRaw = (uint16_t)ADCBUF_VBUS;  /* AN9 */
 
-    /* Phase currents — read to clear */
-    volatile uint16_t ia = ADCBUF0;  /* AN0: Phase C current */
-    volatile uint16_t ib = ADCBUF1;  /* AN1: Phase A current */
-    volatile uint16_t ic = ADCBUF4;  /* AN4: Phase B current */
-    (void)ia;
-    (void)ib;
-    (void)ic;
+    /* Current sensing — read all buffers (clears data-ready flags).
+     * EV43F54A: RS1/RS2/RS3 = 3mΩ shunts.
+     * AN0 (ADCBUF0) = DC bus current via ATA6847 OPO3 (Gt=8) → OA1
+     * AN1 (ADCBUF1) = Phase A current via OA2 (Gt=16)
+     * AN4 (ADCBUF4) = Phase B current via OA3 (Gt=16)
+     * Signed 12-bit fractional format. */
+    /* Current sensing — read all buffers (clears data-ready flags).
+     * AN0 (ADCBUF0): not usable for IBus — ATA6847 CSA3 is internal only,
+     *   no external pin. OA1 R46=12k feedback creates ~7000x gain → saturates.
+     *   Microchip reference (EV43F54A_SMO_Lib) also doesn't use OA1 (AMPEN1=0).
+     * AN1 (ADCBUF1): Phase A current via OA2 (Gt=16, 3mΩ shunt RS1)
+     * AN4 (ADCBUF4): Phase B current via OA3 (Gt=16, 3mΩ shunt RS2)
+     * Phase C has no external shunt — reconstructed as Ic = -(Ia + Ib).
+     *
+     * IBus: computed per commutation step — the PWM-active phase carries
+     * the full DC bus current:
+     *   Steps 0,5: A=PWM → IBus = |Ia|
+     *   Steps 3,4: B=PWM → IBus = |Ib|
+     *   Steps 1,2: C=PWM → IBus = |-(Ia+Ib)| = |Ia+Ib| */
+    (void)ADCBUF0;                      /* AN0: read to clear, not used */
+    gData.iaRaw = (int16_t)ADCBUF1;    /* AN1: Phase A (IS1) */
+    gData.ibRaw = (int16_t)ADCBUF4;    /* AN4: Phase B (IS2) */
+
+    /* Compute IBus from the active PWM phase per commutation step. */
+    {
+        int16_t ibus;
+        switch (gData.currentStep)
+        {
+            case 0: case 5:  /* Phase A is PWM → Ia = IBus */
+                ibus = gData.iaRaw;
+                break;
+            case 3: case 4:  /* Phase B is PWM → Ib = IBus */
+                ibus = gData.ibRaw;
+                break;
+            default:         /* Steps 1,2: Phase C is PWM → Ic = -(Ia+Ib) */
+                ibus = -(gData.iaRaw + gData.ibRaw);
+                break;
+        }
+        gData.ibusRaw = ibus < 0 ? -ibus : ibus;
+    }
 
     /* BEMF zero-crossing detection */
     if (gData.state == ESC_OL_RAMP || gData.state == ESC_CLOSED_LOOP)

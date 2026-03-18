@@ -31,6 +31,9 @@
 #include "hal/hal_com_timer.h"
 #endif
 #include "hal/board_service.h"
+#if FEATURE_GSP
+#include "gsp/gsp.h"
+#endif
 
 /* Debug print rate limiter */
 static volatile uint32_t lastDebugTick = 0;
@@ -160,6 +163,20 @@ static void PrintStatus(void)
                 HAL_UART_WriteString(" D%:");
                 HAL_UART_WriteU16((uint16_t)dutyPct10);
             }
+
+            /* Current sensing: raw signed ADC values.
+             * Ia=Phase A (OA2, Gt=16), Ib=Phase B (OA3, Gt=16),
+             * Ibus=DC bus (OA1, ATA6847 Gt=8). All via 3mΩ shunts.
+             * Convert to mA: phase_mA = raw * 3300 / 4096 / 0.048
+             *                ibus_mA  = raw * 3300 / 4096 / 0.024 */
+            HAL_UART_WriteString(" Ia:");
+            HAL_UART_WriteS16(gData.iaRaw);
+            HAL_UART_WriteString(" Ib:");
+            HAL_UART_WriteS16(gData.ibRaw);
+            HAL_UART_WriteString(" Ibus:");
+            HAL_UART_WriteS16(gData.ibusRaw);
+            if (gData.ataIlimActive)
+                HAL_UART_WriteString(" ILIM!");
         }
 #endif
     }
@@ -247,6 +264,10 @@ int main(void)
     BoardServiceInit();
     GarudaService_Init();
 
+#if FEATURE_GSP
+    GSP_Init();
+#endif
+
     HAL_UART_WriteString("OK");
     HAL_UART_NewLine();
 
@@ -297,20 +318,24 @@ int main(void)
                                 (uint16_t *)&gData.vbusRaw);
         }
 
-        /* Process UART commands */
+#if !FEATURE_GSP
+        /* Process UART commands (debug mode only) */
         if (HAL_UART_IsRxReady())
         {
             uint8_t cmd = HAL_UART_ReadByte();
             DIAG_ProcessCommand(cmd);
         }
+#endif
 
         /* Button 1: Start motor */
         if (IsPressed_Button1())
         {
             if (gData.state == ESC_IDLE)
             {
+#if !FEATURE_GSP
                 HAL_UART_WriteString(">> START");
                 HAL_UART_NewLine();
+#endif
                 GarudaService_StartMotor();
             }
         }
@@ -318,11 +343,14 @@ int main(void)
         /* Button 2: Stop motor */
         if (IsPressed_Button2())
         {
+#if !FEATURE_GSP
             HAL_UART_WriteString(">> STOP");
             HAL_UART_NewLine();
+#endif
             GarudaService_StopMotor();
         }
 
+#if !FEATURE_GSP
         /* Log state transitions immediately */
         if (gStateChanged)
         {
@@ -334,6 +362,7 @@ int main(void)
 
         /* Periodic status output (IDLE: every 5s, active: every 500ms) */
         PrintStatus();
+#endif
 
         /* Heartbeat LED — blink when IDLE, solid ON when running */
         heartbeatCounter++;
@@ -346,6 +375,10 @@ int main(void)
 
         /* Housekeeping */
         GarudaService_MainLoop();
+
+#if FEATURE_GSP
+        GSP_Service();
+#endif
     }
 
     return 0;
