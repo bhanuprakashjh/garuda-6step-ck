@@ -47,17 +47,20 @@ void GSP_CaptureSnapshot(GSP_CK_SNAPSHOT_T *dst)
     dst->stepPeriodHR = src->timing.stepPeriodHR;
 #endif
 
-    /* Compute eRPM (cap at 65535 for uint16_t) */
+    /* Compute eRPM — only when motor is actually running (OL_RAMP or CL) */
     {
         uint32_t erpm = 0;
+        if (src->state >= ESC_OL_RAMP && src->state <= ESC_CLOSED_LOOP)
+        {
 #if FEATURE_IC_ZC
-        if (src->timing.stepPeriodHR > 0 && src->timing.hasPrevZcHR)
-            erpm = 15625000UL / src->timing.stepPeriodHR;
-        else
+            if (src->timing.stepPeriodHR > 0 && src->timing.hasPrevZcHR)
+                erpm = 15625000UL / src->timing.stepPeriodHR;
+            else
 #endif
-        if (src->timing.stepPeriod > 0)
-            erpm = (uint32_t)TIMER1_FREQ_HZ * 10UL / src->timing.stepPeriod;
-        dst->eRpm = (erpm > 65535UL) ? 65535U : (uint16_t)erpm;
+            if (src->timing.stepPeriod > 0)
+                erpm = (uint32_t)TIMER1_FREQ_HZ * 10UL / src->timing.stepPeriod;
+        }
+        dst->eRpm = erpm;
     }
 
     /* ZC diagnostics */
@@ -73,6 +76,47 @@ void GSP_CaptureSnapshot(GSP_CK_SNAPSHOT_T *dst)
     /* System */
     dst->systemTick = src->systemTick;
     dst->uptimeSec  = src->systemTick / 1000;
+
+    /* ZC diagnostics */
+    dst->zcLatencyPct  = src->zcDiag.zcLatencyPct;
+    if (src->timing.stepPeriodHR > 0)
+        dst->zcBlankPct = (uint8_t)((uint32_t)src->zcDiag.lastBlankingHR * 100
+                                     / src->timing.stepPeriodHR);
+    else
+        dst->zcBlankPct = 0;
+    dst->zcBypassCount = src->zcDiag.diagBypassAccepted;
+
+    /* ZC V2 diagnostics */
+    dst->zcMode = (uint8_t)src->zcCtrl.mode;
+    {
+        uint16_t fc = src->zcDiag.actualForcedComm;
+        dst->actualForcedComm = (fc > 255u) ? 255u : (uint8_t)fc;
+    }
+    dst->zcTimeoutCount  = src->zcDiag.zcTimeoutCount;
+    dst->risingZcCount   = src->zcDiag.diagRisingZcCount;
+    dst->fallingZcCount  = src->zcDiag.diagFallingZcCount;
+    dst->risingTimeouts  = src->zcDiag.diagRisingTimeouts;
+    dst->fallingTimeouts = src->zcDiag.diagFallingTimeouts;
+
+    /* Per-step 0..5 counters */
+    {
+        uint8_t i;
+        for (i = 0; i < 6; i++) {
+            dst->stepAccepted[i] = src->zcDiag.stepAccepted[i];
+            dst->stepTimeouts[i] = src->zcDiag.stepTimeouts[i];
+        }
+    }
+
+    /* Raw comparator edge trace */
+#if FEATURE_IC_ZC
+    {
+        uint8_t i;
+        for (i = 0; i < 6; i++) {
+            dst->stepFlips[i] = src->icZc.stepFlips[i];
+            dst->stepPolls[i] = src->icZc.stepPolls[i];
+        }
+    }
+#endif
 }
 
 #endif /* FEATURE_GSP */

@@ -44,6 +44,8 @@ typedef enum {
     GSP_CMD_LOAD_DEFAULTS   = 0x13,
     GSP_CMD_TELEM_START     = 0x14,
     GSP_CMD_TELEM_STOP      = 0x15,
+    GSP_CMD_GET_PARAM_LIST  = 0x16,
+    GSP_CMD_LOAD_PROFILE    = 0x17,
     GSP_CMD_TELEM_FRAME     = 0x80,
     GSP_CMD_ERROR           = 0xFF
 } GSP_CMD_ID_T;
@@ -55,6 +57,8 @@ typedef enum {
     GSP_ERR_BUSY             = 0x03,
     GSP_ERR_WRONG_STATE      = 0x04,
     GSP_ERR_OUT_OF_RANGE     = 0x05,
+    GSP_ERR_UNKNOWN_PARAM    = 0x06,
+    GSP_ERR_CROSS_VALIDATION = 0x07,
 } GSP_ERR_CODE_T;
 
 /* GSP_INFO_T — 20 bytes, same as AK board (protocol-compatible) */
@@ -83,10 +87,11 @@ typedef struct __attribute__((packed)) {
 #define GSP_FEATURE_GSP         (1UL << 16)  /* GSP protocol active */
 
 /**
- * GSP_CK_SNAPSHOT_T — 48 bytes, CK board telemetry snapshot.
+ * GSP_CK_SNAPSHOT_T — 64 bytes, CK board telemetry snapshot.
  *
- * Different from AK board's 170-byte snapshot (FOC fields).
- * GUI detects CK board via boardId=0x0002 and uses CK decoder.
+ * V1: 48 bytes (core + electrical + speed + ZC diag + system)
+ * V2: 52 bytes (+zcLatencyPct, zcBlankPct, zcBypassCount)
+ * V3: 64 bytes (+zcMode, actualForcedComm, per-polarity counters)
  */
 typedef struct __attribute__((packed)) {
     /* Core state (8B) */
@@ -104,12 +109,11 @@ typedef struct __attribute__((packed)) {
     int16_t  ibRaw;             /* Phase B current (signed, fractional) */
     int16_t  ibusRaw;           /* Reconstructed bus current (abs value) */
     uint16_t duty;              /* Raw duty count */
-    uint16_t pad0;
 
-    /* Speed/timing (12B) */
+    /* Speed/timing (14B) */
     uint16_t stepPeriod;        /* Timer1 ticks */
     uint16_t stepPeriodHR;      /* SCCP4 HR ticks (640ns) */
-    uint16_t eRpm;              /* Computed eRPM (capped 65535) */
+    uint32_t eRpm;              /* Computed eRPM (full 32-bit, A2212 reaches 100k+) */
     uint16_t goodZcCount;
     uint16_t zcInterval;
     uint16_t prevZcInterval;
@@ -119,12 +123,34 @@ typedef struct __attribute__((packed)) {
     uint16_t icFalse;           /* Rejected ZCs */
     uint8_t  filterLevel;       /* Current deglitch FL */
     uint8_t  missedSteps;       /* consecutiveMissedSteps */
-    uint8_t  forcedSteps;       /* stepsSinceLastZc */
+    uint8_t  forcedSteps;       /* LEGACY: stepsSinceLastZc (NOT real forced comm count).
+                                 * Use actualForcedComm below for real timeout count. */
     uint8_t  ilimActive;        /* ATA6847 ILIM chopping */
 
     /* System (8B) */
     uint32_t systemTick;        /* 1ms counter */
     uint32_t uptimeSec;
+
+    /* ZC diagnostics v1 (4B) */
+    uint8_t  zcLatencyPct;      /* 0-255: ZC position in window, 0xFF=timeout */
+    uint8_t  zcBlankPct;        /* Layer 1 blanking as % of step period */
+    uint16_t zcBypassCount;     /* ZCs accepted via polarity bypass (legacy) */
+
+    /* ZC V2 diagnostics (12B) */
+    uint8_t  zcMode;            /* ZC_MODE_ACQUIRE/TRACK/RECOVER */
+    uint8_t  actualForcedComm;  /* true timeout-forced commutations (saturated 255) */
+    uint16_t zcTimeoutCount;    /* total ZC timeouts */
+    uint16_t risingZcCount;     /* rising polarity ZC accepts */
+    uint16_t fallingZcCount;    /* falling polarity ZC accepts */
+    uint16_t risingTimeouts;    /* rising polarity timeouts */
+    uint16_t fallingTimeouts;   /* falling polarity timeouts */
+
+    /* Per-step 0..5 counters (24B) — phase-pair vs polarity-class test */
+    uint16_t stepAccepted[6];   /* ZCs accepted per commutation step */
+    uint16_t stepTimeouts[6];   /* timeouts per commutation step */
+    /* Raw comparator edge trace (24B) */
+    uint16_t stepFlips[6];      /* comparator transitions per step (glitch count) */
+    uint16_t stepPolls[6];      /* total polls per step */
 } GSP_CK_SNAPSHOT_T;
 
 /* XC16 doesn't support _Static_assert. Verify size at compile time:

@@ -62,20 +62,21 @@ void HAL_ATA6847_Init(void)
     /* Wake-up control */
     HAL_ATA6847_WriteReg(ATA_WUCR, 0x03);
 
-    /* Current limitation — cycle-by-cycle chopping mode.
-     * ILIMEN=1: hardware current limiter ENABLED
-     * ILIMSDEN=0: CHOPPING mode (not shutdown) — motor keeps running,
-     *   ATA6847 chops the active gate when current exceeds threshold.
-     *   Critical for drones: shutdown mode = instant crash mid-flight.
-     * ILIMFLT=4: 1000ns deglitch filter (avoids trips on PWM transients)
-     * DAC threshold set per motor profile in garuda_config.h. */
-    HAL_ATA6847_WriteReg(ATA_ILIMCR, (1 << 7) | (6 << 3) | (0 << 2));
-    /* ILIMFLT=6 (1750ns) — was 4 (1000ns). Longer filter avoids
-     * nuisance trips on PWM switching transients at 20kHz. */
+    /* Current limitation — DISABLED.
+     * Cycle-by-cycle chopping limits prop performance: at 24V with
+     * 8" props, phase current transients during commutation reach
+     * 15-25A even at mid-speed, triggering ILIM and capping eRPM.
+     * VDS short-circuit protection (SCPCR) still active for hardware
+     * safety. Software RECOVER mode handles desync current. */
+    HAL_ATA6847_WriteReg(ATA_ILIMCR, (0 << 7) | (6 << 3) | (0 << 2));
     HAL_ATA6847_WriteReg(ATA_ILIMTH, ILIM_DAC);
 
     /* Short circuit protection */
-    HAL_ATA6847_WriteReg(ATA_SCPCR, (1 << 7) | (5 << 3) | 1);
+    HAL_ATA6847_WriteReg(ATA_SCPCR, (1 << 7) | (7 << 3) | 7);
+    /* SCTHSEL=7 (2000mV). VDS spikes scale with Vbus — at 24V the
+     * switching transients exceed 1500mV at moderate current, tripping
+     * SCTHSEL=5. 2000mV gives headroom for 24V operation.
+     * SCTHLSEL=7 for low-side too. Still protects real shorts. */
 
     /* Current sense: disabled, gain=16, offset=VRef/2 */
     HAL_ATA6847_WriteReg(ATA_CSCR, (0x00 << 5) | (0x03 << 2) | 0x01);
@@ -85,12 +86,32 @@ void HAL_ATA6847_Init(void)
 
     /* GDUCR1-4 (match reference byte values) */
     HAL_ATA6847_WriteReg(ATA_GDUCR1, (7 << 2) | (1 << 1) | 1);   /* 0x1F: BEMFEN=1 for 6-step ZC */
-    HAL_ATA6847_WriteReg(ATA_GDUCR2, (1 << 7) | (1 << 6) | 5);   /* 0xC5 */
-    HAL_ATA6847_WriteReg(ATA_GDUCR3, (0x01 << 2));                /* 0x04 */
+    /* GDUCR2: Edge blanking time + standby behavior.
+     * EGBLT[3:0] = N → blanking = N × 250ns (0=off, 1=250ns, ..., 15=3750ns).
+     * Was 5 (1250ns). Increased to 12 (3000ns = 3µs) — at high speed the
+     * BEMF comparator sees switching transients during demag that pass
+     * the software deglitch filter. HW blanking suppresses the comparator
+     * output itself, which software blanking cannot do.
+     * HSOFF=1, LSOFF=1: HS/LS off in standby. TSWTO=0b00: 250ns adaptive. */
+    HAL_ATA6847_WriteReg(ATA_GDUCR2, (1 << 7) | (1 << 6) | 15);  /* 0xCF: EGBLT=15 (3.75µs MAX).
+                                                                     * Helps at 18V. At 24V the Vbus
+                                                                     * swings dominate, not EGBLT.
+                                                                     * 3µs covers the ringing. */
+    /* GDUCR3: Slew rate + adaptive dead-time.
+     * HSSRC=0b11 (12.5%), LSSRC=0b00 (full speed), no adaptive dead time.
+     * Asymmetric by design — slow HS reduces ringing. Tested alternatives:
+     *   Both 50%: desync at 28k eRPM (slower LS = more noise)
+     *   Both full: desync at 45k eRPM (fast HS ringing)
+     *   Adaptive dead time: unreliable CL entry (3 attempts needed) */
+    HAL_ATA6847_WriteReg(ATA_GDUCR3, (0x03 << 2));                /* 0x0C */
     HAL_ATA6847_WriteReg(ATA_GDUCR4, (1 << 6) | (1 << 5) | (1 << 4) | 2); /* 0x72 */
 
-    /* Interrupt masks */
-    HAL_ATA6847_WriteReg(ATA_SIECER1, 0xE7);
+    /* Interrupt masks.
+     * SIECER1 bit 5 (ILIMM) = 0: mask ILIM from nIRQ.
+     * ILIM chopping is cycle-by-cycle and non-latching — it should
+     * chop silently, not trigger a fault that kills the motor.
+     * Was 0xE7 (ILIM unmasked), now 0xC7 (ILIM masked). */
+    HAL_ATA6847_WriteReg(ATA_SIECER1, 0xC7);
     HAL_ATA6847_WriteReg(ATA_SIECER2, 0x1F);
 
     /* Device operation mode: Normal + RSTLVL

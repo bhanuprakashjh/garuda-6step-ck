@@ -59,9 +59,14 @@ static volatile uint8_t uvDebounce = 0;
  * UP: 25 counts/tick → full range in ~20ms
  * DOWN: 10 counts/tick → ramp-to-idle in ~17ms
  *   This prevents ZC desync during CL entry and pot-down sweeps. */
-#define DUTY_SLEW_UP    25U
-#define DUTY_SLEW_DOWN  10U
+#define DUTY_SLEW_UP     3U   /* ~200ms full range (was 25 = 20ms).
+                              * Slow enough for stepPeriod IIR to track.
+                              * Fast pot sweep at 25 caused acceleration
+                              * faster than ZC Layer 2 could follow →
+                              * real ZCs rejected as "too early" → desync. */
+#define DUTY_SLEW_DOWN   5U   /* ~100ms ramp down (was 10 = 50ms) */
 static volatile uint32_t slewedDuty = 0;
+static volatile uint32_t rampExitDuty = 0;  /* duty at OL→CL transition, used as ACQUIRE cap */
 
 /* CL settle: hold ramp duty for N ticks after CL entry before switching
  * to pot control. Lets ZC tracking stabilize after OL→CL handoff. */
@@ -151,6 +156,8 @@ void GarudaService_Init(void)
     gData.timer1Tick = 0;
     gData.armCounter = 0;
     gData.runCommandActive = false;
+    gData.gspThrottleActive = false;
+    gData.gspThrottleValue = 0;
     gData.desyncRestartAttempts = 0;
     gData.recoveryCounter = 0;
     BEMF_ZC_Init((volatile GARUDA_DATA_T *)&gData);
@@ -171,12 +178,21 @@ void GarudaService_StartMotor(void)
 
     HAL_UART_WriteString("SM:clr ");
 
-    /* Clear ATA6847 faults */
+    /* Clear ATA6847 faults — may need multiple attempts after desync.
+     * VDS/SC faults latch until cleared AND the fault condition is gone. */
+    HAL_ATA6847_ClearFaults();
+    { volatile uint32_t d; for (d = 0; d < 50000UL; d++); }  /* ~5ms */
     HAL_ATA6847_ClearFaults();
 
     HAL_UART_WriteString("gdu ");
 
-    /* Power up GDU */
+    /* Power up GDU — retry once if first attempt fails */
+    if (!HAL_ATA6847_EnterGduNormal())
+    {
+        { volatile uint32_t d; for (d = 0; d < 100000UL; d++); }  /* ~10ms */
+        HAL_ATA6847_ClearFaults();
+        { volatile uint32_t d; for (d = 0; d < 50000UL; d++); }
+    }
     if (!HAL_ATA6847_EnterGduNormal())
     {
         HAL_UART_WriteString("FAIL!");
@@ -259,9 +275,23 @@ void GarudaService_StopMotor(void)
 
     gData.state = ESC_IDLE;
     gData.duty = 0;
+    gData.faultCode = FAULT_NONE;
+    gData.gspThrottleActive = false;
+    gData.gspThrottleValue = 0;
 
     LED_RUN = 0;
     LED_FAULT = 0;
+}
+
+void GarudaService_ClearFault(void)
+{
+    if (gData.state == ESC_FAULT)
+    {
+        gData.state = ESC_IDLE;
+        gData.faultCode = FAULT_NONE;
+        gData.runCommandActive = false;
+        LED_FAULT = 0;
+    }
 }
 
 /* ── Main Loop (called from while(1) in main.c) ──────────────────── */
@@ -286,8 +316,19 @@ void GarudaService_MainLoop(void)
     if (deferredRestart)
     {
         deferredRestart = false;
-        if (gData.runCommandActive && gData.state == ESC_IDLE)
+        if (gData.state == ESC_IDLE)
             GarudaService_StartMotor();
+    }
+
+    /* FAULT state: clear fault on SW1 press (same as normal start).
+     * Don't auto-restart — ATA6847 faults need the motor to stop
+     * completely before GDU can re-enter Normal mode. */
+    if (gData.state == ESC_FAULT && BTN1_GetValue() == 0)
+    {
+        gData.state = ESC_IDLE;
+        gData.faultCode = FAULT_NONE;
+        gData.desyncRestartAttempts = 0;
+        LED_FAULT = 0;
     }
 
     /* Handle deferred fault — do the SPI standby that ISR couldn't */
@@ -297,70 +338,59 @@ void GarudaService_MainLoop(void)
         HAL_ATA6847_EnterGduStandby();
     }
 
-    /* ATA6847 fault decode — nIRQ was asserted, read SIR1 via SPI.
-     * The ATA6847 has already taken protective action (chopping or shutdown)
-     * before we get here. We just need to decode and respond. */
+    /* ATA6847 fault decode — PWM is already OFF (killed by ISR),
+     * so SPI reads are safe (no EMI from switching). */
     if (gData.ataFaultPending)
     {
         gData.ataFaultPending = false;
+
+        /* Put GDU to standby (SPI write — safe, PWM is off) */
+        HAL_ATA6847_EnterGduStandby();
+
+        /* Now read fault details via SPI */
         uint8_t sir1 = HAL_ATA6847_ReadReg(ATA_SIR1);
         gData.ataLastSIR1 = sir1;
 
-        if (sir1 & 0x10)  /* ILIM — current limit chopping */
+        /* Decode and log specific fault */
+        if (sir1 != 0xFF)  /* 0xFF = SPI timeout, skip decode */
         {
-            /* Informational: motor is running at current limit.
-             * Don't stop — chopping mode keeps motor safe. Log it. */
-            gData.ataIlimActive = true;
-            /* Clear the ILIM flag */
-            HAL_ATA6847_WriteReg(ATA_SIR1, 0x10);
+            if (sir1 & 0x02)  /* VDSSC — VDS short circuit */
+            {
+                gData.faultCode = FAULT_ATA6847;
+                HAL_UART_WriteString("\r\n!ATA SC SIR3=");
+                HAL_UART_WriteHex8(HAL_ATA6847_ReadReg(ATA_SIR3));
+                HAL_UART_NewLine();
+            }
+            else if (sir1 & 0x04)  /* OVTF — over-temperature */
+            {
+                gData.faultCode = FAULT_ATA6847;
+                HAL_UART_WriteString("\r\n!ATA OVT\r\n");
+            }
+            else if (sir1 & 0x80)  /* VSUPF — supply failure */
+            {
+                gData.faultCode = FAULT_ATA6847;
+                HAL_UART_WriteString("\r\n!ATA VSUP\r\n");
+            }
+            else if (sir1 & 0x01)  /* VGSUV — gate under-voltage */
+            {
+                gData.faultCode = FAULT_ATA6847;
+                HAL_UART_WriteString("\r\n!ATA VGSUV\r\n");
+            }
+            else if (sir1 & 0x10)  /* ILIM — was just chopping, not critical */
+            {
+                /* ILIM triggered but not a hard fault — motor was stopped
+                 * by ISR as precaution. Could be spurious from EMI. */
+                gData.faultCode = FAULT_ATA6847;
+                HAL_UART_WriteString("\r\n!ATA ILIM\r\n");
+            }
         }
 
-        if (sir1 & 0x02)  /* VDSSC — VDS short circuit */
-        {
-            /* Critical: a MOSFET has desaturated. GDU already shut down. */
-            uint8_t sir3 = HAL_ATA6847_ReadReg(ATA_SIR3);
-            HAL_UART_WriteString("\r\n!ATA SC:");
-            HAL_UART_WriteHex8(sir3);
-            HAL_UART_NewLine();
-            HAL_ATA6847_ClearFaults();
-            EnterFault(FAULT_ATA6847);
-        }
-
-        if (sir1 & 0x04)  /* OVTF — over-temperature */
-        {
-            HAL_UART_WriteString("\r\n!ATA OVT\r\n");
-            HAL_ATA6847_ClearFaults();
-            EnterFault(FAULT_ATA6847);
-        }
-
-        if (sir1 & 0x80)  /* VSUPF — supply failure */
-        {
-            HAL_UART_WriteString("\r\n!ATA VSUP\r\n");
-            HAL_ATA6847_ClearFaults();
-            EnterFault(FAULT_ATA6847);
-        }
-
-        if (sir1 & 0x01)  /* VGSUV — gate under-voltage */
-        {
-            HAL_UART_WriteString("\r\n!ATA VGSUV\r\n");
-            HAL_ATA6847_ClearFaults();
-            EnterFault(FAULT_ATA6847);
-        }
-    }
-    else
-    {
-        gData.ataIlimActive = false;
+        /* Clear ATA6847 fault registers */
+        HAL_ATA6847_ClearFaults();
     }
 
-    /* Fault state: auto-clear after deferred fault handler runs.
-     * User can press BTN1 again to retry, or BTN2 to stop. */
-    if (gData.state == ESC_FAULT)
-    {
-        gData.runCommandActive = false;
-        gData.state = ESC_IDLE;
-        gData.faultCode = FAULT_NONE;
-        LED_FAULT = 0;
-    }
+    /* Fault state: do NOT auto-clear. User must press Clear Fault
+     * (GUI button or BTN2) to acknowledge and return to IDLE. */
 }
 
 /* ── Timer1 ISR (20 kHz = 50 µs) ─────────────────────────────────── */
@@ -377,12 +407,30 @@ void __attribute__((interrupt, auto_psv)) _T1Interrupt(void)
         gData.systemTick++;
     }
 
-    /* ATA6847 nIRQ poll — active low when any enabled fault occurs.
-     * Latency: ≤50µs (one Timer1 tick). The ATA6847 has already taken
-     * protective action (gate chopping or shutdown) before we read this.
-     * Main loop decodes the specific fault via SPI. */
-    if (!nIRQ_GetValue() && gData.state >= ESC_OL_RAMP)
-        gData.ataFaultPending = true;
+    /* ATA6847 nIRQ — active low when fault occurs.
+     * Strategy: kill PWM IMMEDIATELY in ISR (no SPI — EMI would hang it).
+     * Main loop reads SPI fault details AFTER PWM is off (safe). */
+    {
+        static uint16_t nirqDiv = 0;
+        if (++nirqDiv >= 200)  /* Check every 10ms (rate-limited for EMI) */
+        {
+            nirqDiv = 0;
+            if (!nIRQ_GetValue() && gData.state >= ESC_OL_RAMP)
+            {
+                /* Kill PWM immediately — no SPI here, just registers */
+                HAL_PWM_DisableOutputs();
+#if FEATURE_IC_ZC
+                HAL_ZcTimer_Stop();
+                HAL_ComTimer_Cancel();
+#endif
+                gData.state = ESC_FAULT;
+                gData.faultCode = FAULT_ATA6847;
+                gData.ataFaultPending = true;  /* Main loop decodes via SPI */
+                LED_FAULT = 1;
+                LED_RUN = 0;
+            }
+        }
+    }
 
     switch (gData.state)
     {
@@ -436,6 +484,24 @@ void __attribute__((interrupt, auto_psv)) _T1Interrupt(void)
             {
                 gData.state = ESC_CLOSED_LOOP;
                 gData.timing.consecutiveMissedSteps = 0;
+                gData.timing.stepsSinceLastZc = 0;
+                gData.zcCtrl.mode = ZC_MODE_ACQUIRE;
+                gData.zcCtrl.acquireGoodCount = 0;
+                gData.zcCtrl.recoverAttempts = 0;
+                /* Phase 4: seed refIntervalHR from stepPeriodHR */
+                gData.zcCtrl.refIntervalHR = gData.timing.stepPeriodHR;
+                /* Capture ramp exit duty for ACQUIRE mode cap */
+                rampExitDuty = gData.duty;
+#if FEATURE_SPEED_PD
+                /* Seed PD override from ramp exit duty */
+                gData.speedPd.override = (int32_t)gData.duty;
+                gData.speedPd.lastError = 0;
+                gData.speedPd.targetErpm = 0;
+#endif
+                gData.timing.bypassSuppressed = true;  /* Suppress bypass
+                    * until first confirmed CL ZC. Prevents polarity-
+                    * blind acceptance during CL entry when the estimator
+                    * has no valid reference yet. */
                 slewedDuty = gData.duty;  /* Seed slew from ramp exit duty */
                 clSettleCounter = CL_SETTLE_TICKS;
 
@@ -450,6 +516,22 @@ void __attribute__((interrupt, auto_psv)) _T1Interrupt(void)
                     gData.timing.stepPeriodHR =
                         (seedHR <= 65535U) ? (uint16_t)seedHR : 0;
                 }
+                /* Seed HR checkpoint and lastZcTickHR so Layer 2 (50%
+                 * interval rejection in FastPoll) and Layer 3 (50%
+                 * checkpoint rejection in RecordZcTiming) are active
+                 * from the first CL step.
+                 *
+                 * Without this, lastZcTickHR is stale (0 from init),
+                 * causing elapsed to wrap large → Layer 2 bypassed →
+                 * demag tail accepted as false ZC → IIR poisoned.
+                 *
+                 * Seed lastZcTickHR = now - stepPeriodHR so the 50%
+                 * window opens at the right time: first valid ZC at
+                 * ~50% of step period will pass, demag at ~10-30% won't. */
+                gData.timing.checkpointStepPeriodHR =
+                    gData.timing.stepPeriodHR;
+                gData.timing.lastZcTickHR =
+                    HAL_ComTimer_ReadTimer() - gData.timing.stepPeriodHR;
                 /* Set up fast poll for the current step */
                 BEMF_ZC_OnCommutation((volatile GARUDA_DATA_T *)&gData);
                 /* Start SCCP1 fast poll timer */
@@ -492,16 +574,116 @@ void __attribute__((interrupt, auto_psv)) _T1Interrupt(void)
 
                 if (gData.timing.zcSynced)
                 {
-                    /* Synced: pot-mapped with idle floor */
-                    target = MapThrottleToDuty(gData.potRaw);
+#if FEATURE_SPEED_PD
+                    /* Speed PD controller — AM32-style accumulated override.
+                     * pot → target_eRPM → PD → duty override.
+                     * Runs at 1ms rate (every 20 Timer1 ticks). */
+                    {
+                        static uint16_t pdDiv = 0;
+                        if (++pdDiv >= 20)
+                        {
+                            pdDiv = 0;
+
+                            /* 1. Target eRPM from pot */
+                            uint16_t potVal = gData.gspThrottleActive
+                                ? gData.gspThrottleValue : gData.potRaw;
+                            uint32_t tgtErpm;
+                            if (potVal < POT_DEADZONE)
+                                tgtErpm = MIN_TARGET_ERPM;
+                            else if (potVal > POT_MAX)
+                                tgtErpm = MAX_TARGET_ERPM;
+                            else
+                                tgtErpm = MIN_TARGET_ERPM +
+                                    (uint32_t)(MAX_TARGET_ERPM - MIN_TARGET_ERPM)
+                                    * (potVal - POT_DEADZONE)
+                                    / (POT_MAX - POT_DEADZONE);
+                            gData.speedPd.targetErpm = tgtErpm;
+
+                            /* 2. Measured eRPM from protected estimator */
+                            bool fbValid = (gData.zcCtrl.refIntervalHR > 0 &&
+                                            gData.timing.zcSynced);
+                            uint32_t measErpm = 0;
+                            if (fbValid)
+                                measErpm = 15625000UL / gData.zcCtrl.refIntervalHR;
+
+                            /* 3. PD computation (only with valid feedback) */
+                            if (fbValid)
+                            {
+                                int32_t error = (int32_t)tgtErpm - (int32_t)measErpm;
+                                int32_t dError = error - gData.speedPd.lastError;
+                                gData.speedPd.lastError = error;
+
+                                gData.speedPd.override +=
+                                    (error * (int32_t)SPEED_PD_KP +
+                                     dError * (int32_t)SPEED_PD_KD)
+                                    / (int32_t)SPEED_PD_SCALE;
+
+                                /* Clamp */
+                                if (gData.speedPd.override > (int32_t)MAX_DUTY)
+                                    gData.speedPd.override = (int32_t)MAX_DUTY;
+                                if (gData.speedPd.override < (int32_t)CL_IDLE_DUTY)
+                                    gData.speedPd.override = (int32_t)CL_IDLE_DUTY;
+                            }
+                            /* If feedback invalid: freeze override */
+                        }
+                        target = (uint32_t)gData.speedPd.override;
+                    }
+#else
+                    /* Open-loop: pot → duty */
+                    target = MapThrottleToDuty(
+                        gData.gspThrottleActive ? gData.gspThrottleValue : gData.potRaw);
+#endif
+
+                    /* Mode-specific duty limiting (applies to both PD and open-loop) */
+                    switch (gData.zcCtrl.mode)
+                    {
+                        case ZC_MODE_ACQUIRE:
+                            if (target > rampExitDuty)
+                                target = rampExitDuty;
+                            break;
+                        case ZC_MODE_RECOVER:
+                            if (target > slewedDuty)
+                                target = slewedDuty;
+                            break;
+                        case ZC_MODE_TRACK:
+                            break;
+                    }
                 }
                 else
                 {
-                    /* NOT synced: ramp down to idle for safety.
-                     * Motor is on forced commutation — reduce duty
-                     * to help ZC detection recover. */
+                    /* NOT synced — reduce duty to idle via normal slew. */
                     target = CL_IDLE_DUTY;
+#if FEATURE_SPEED_PD
+                    gData.speedPd.override = (int32_t)CL_IDLE_DUTY;
+                    gData.speedPd.lastError = 0;
+#endif
                 }
+
+                /* Phase 9: Speed governance (ESCape32-style duty_ramp).
+                 * Limit max duty based on measured eRPM so the motor can't
+                 * be driven faster than the estimator can track.
+                 * duty_max ramps linearly from CL_IDLE_DUTY at 0 eRPM to
+                 * MAX_DUTY at DUTY_RAMP_ERPM. Above DUTY_RAMP_ERPM: no cap.
+                 *
+                 * This prevents the desync-on-fast-pot failure: the motor
+                 * can only get more duty as it proves it can commutate at
+                 * the current speed. */
+#if FEATURE_IC_ZC
+                {
+                    uint32_t measuredErpm = 0;
+                    if (gData.zcCtrl.refIntervalHR > 0)
+                        measuredErpm = 15625000UL / gData.zcCtrl.refIntervalHR;
+
+                    if (measuredErpm < DUTY_RAMP_ERPM)
+                    {
+                        uint32_t maxDuty = CL_IDLE_DUTY +
+                            (uint32_t)(MAX_DUTY - CL_IDLE_DUTY)
+                            * measuredErpm / DUTY_RAMP_ERPM;
+                        if (target > maxDuty)
+                            target = maxDuty;
+                    }
+                }
+#endif
 
                 /* Asymmetric slew: fast up, slow down */
                 if (target > slewedDuty)
@@ -518,9 +700,6 @@ void __attribute__((interrupt, auto_psv)) _T1Interrupt(void)
                 gData.duty = slewedDuty;
                 HAL_PWM_SetDutyCycle(gData.duty);
             }
-
-            /* Commutation deadline is checked in ADC ISR (20 kHz)
-             * for better timing resolution. See _ADCInterrupt. */
 
             /* Check for ZC timeout */
             ZC_TIMEOUT_RESULT_T tout = BEMF_ZC_CheckTimeout(
@@ -539,7 +718,47 @@ void __attribute__((interrupt, auto_psv)) _T1Interrupt(void)
                     EnterFaultISR(FAULT_DESYNC);
                 }
             }
-            else if (tout == ZC_TIMEOUT_FORCE_STEP)
+
+            /* Bypass-count desync detection. In healthy operation, bypass
+             * fires 0-1 times (CL entry only). During a false-ZC cascade,
+             * bypass fires hundreds of times per second as wrong-polarity
+             * ZCs are accepted. Detect via rate: if bypass count grows
+             * by >20 over a 10ms window, trigger recovery.
+             *
+             * Don't use DESYNC_RESTART_MAX — that causes permanent fault
+             * after 3 attempts. Instead always recover and let the user
+             * stop the motor via button if it keeps failing. */
+            {
+                static uint16_t prevBypassCount = 0;
+                static uint16_t bypassCheckDiv = 0;
+                if (++bypassCheckDiv >= 200)  /* Check every 10ms (200 × 50µs) */
+                {
+                    bypassCheckDiv = 0;
+                    uint16_t bypassDelta = gData.zcDiag.diagBypassAccepted
+                                         - prevBypassCount;
+                    prevBypassCount = gData.zcDiag.diagBypassAccepted;
+                    if (bypassDelta > 20)
+                    {
+                        EnterRecovery();
+                    }
+                }
+            }
+
+            /* Reset desync restart counter when stable in CL for 2 seconds */
+            if (gData.timing.zcSynced && gData.systemTick > 2000 &&
+                gData.desyncRestartAttempts > 0)
+            {
+                static uint32_t stableStartTick = 0;
+                if (stableStartTick == 0)
+                    stableStartTick = gData.systemTick;
+                else if (gData.systemTick - stableStartTick > 2000)
+                {
+                    gData.desyncRestartAttempts = 0;
+                    stableStartTick = 0;
+                }
+            }
+
+            if (tout == ZC_TIMEOUT_FORCE_STEP)
             {
                 /* Force a commutation step.
                  * Gate out higher-priority ISRs (SCCP1/SCCP4) during the
@@ -568,11 +787,14 @@ void __attribute__((interrupt, auto_psv)) _T1Interrupt(void)
             }
             else
             {
-                /* Retry: go back to IDLE, main loop will restart */
+                /* Retry: go back to IDLE, auto-restart.
+                 * Always restart after desync recovery — if pot is
+                 * non-zero the user wants the motor running. The old
+                 * runCommandActive check caused hangs when SW1 wasn't
+                 * held during recovery. */
                 HAL_PWM_DisableOutputs();
                 gData.state = ESC_IDLE;
-                if (gData.runCommandActive)
-                    deferredRestart = true;
+                deferredRestart = true;
             }
             break;
 
@@ -775,5 +997,80 @@ void __attribute__((interrupt, no_auto_psv)) _CCP4Interrupt(void)
 
     _CCP4IF = 0;
 }
+
+#if FEATURE_IC_ZC_CAPTURE
+/**
+ * @brief SCCP2 Input Capture ISR — pure IC-driven ZC detection.
+ *
+ * Replaces the poll path for ZC detection. On the first comparator edge
+ * after blanking, validates the interval, records timing, and schedules
+ * commutation directly. No deglitch filter — single edge = ZC.
+ *
+ * The poll path (FastPoll) still runs but serves only as a fallback
+ * if the IC misses an edge (e.g. no transition occurs).
+ */
+void __attribute__((interrupt, no_auto_psv)) _CCP2Interrupt(void)
+{
+    /* One-shot: disarm immediately to prevent bounce re-triggers */
+    _CCP2IE = 0;
+    _CCP2IF = 0;
+
+    /* Only process during closed-loop AND when IC was properly armed. */
+    if (gData.state != ESC_CLOSED_LOOP || !gData.icZc.icArmed)
+        return;
+
+    /* If poll path already got this ZC, stop */
+    if (gData.bemf.zeroCrossDetected)
+        return;
+
+    /* HYBRID: IC provides precise timestamp, poll validates.
+     * IC latches timestamp ONLY if the edge passes 50% interval check.
+     * This prevents noise edges (before 50%) from providing a wrong
+     * early timestamp that the poll later confirms and schedules from. */
+
+    /* Backdate IC timestamp to SCCP4 domain. */
+    uint16_t icCapture = HAL_ZcIC_ReadCapture();
+    uint16_t icNow     = HAL_ZcIC_ReadTimer();
+    uint16_t s4Now     = HAL_ComTimer_ReadTimer();
+    uint16_t elapsed   = icNow - icCapture;
+    uint16_t zcTickHR  = s4Now - elapsed;
+
+    /* 50% interval rejection — same as poll path Layer 2.
+     * Reject noise edges that arrive before 50% of expected interval.
+     * Without this, IC latches an early timestamp that the poll later
+     * confirms (comparator stayed in expected state), causing early
+     * commutation → rough operation → current spikes → OV fault. */
+    {
+        uint16_t sinceLastZc = zcTickHR - gData.timing.lastZcTickHR;
+        uint16_t ref = gData.zcCtrl.refIntervalHR;
+        if (ref == 0) ref = gData.timing.stepPeriodHR;
+        uint16_t halfInterval = ref >> 1;
+        if (halfInterval > 0 && (int16_t)(sinceLastZc - halfInterval) < 0)
+        {
+            /* Too early — noise edge. Don't latch timestamp.
+             * Poll will use its own timestamp when it confirms. */
+            gData.icZc.diagIcBounce++;
+            return;
+        }
+    }
+
+    gData.icZc.zcCandidateHR = zcTickHR;
+    {
+        uint16_t elapsedT1 = (uint16_t)((uint32_t)elapsed * COM_TIMER_T1_DENOM
+                                         / COM_TIMER_T1_NUMER);
+        gData.icZc.zcCandidateT1 = gData.timer1Tick - elapsedT1;
+    }
+    gData.icZc.icArmed = false;
+    gData.icZc.diagIcAccepted++;
+
+    /* IC only stores the precise timestamp. Does NOT call
+     * RecordZcTiming or ScheduleCommutation — that corrupts the
+     * estimator if this edge is noise.
+     *
+     * The poll path reads CLC D-FF output (clean, PWM-sync sampled).
+     * When CLC confirms expected state, poll calls RecordZcTiming
+     * using the IC's stored timestamp → precise + validated. */
+}
+#endif /* FEATURE_IC_ZC_CAPTURE */
 
 #endif /* FEATURE_IC_ZC */

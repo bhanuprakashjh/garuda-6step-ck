@@ -29,10 +29,12 @@
 #if FEATURE_IC_ZC
 #include "hal/hal_ic.h"
 #include "hal/hal_com_timer.h"
+#include "hal/hal_clc.h"
 #endif
 #include "hal/board_service.h"
 #if FEATURE_GSP
 #include "gsp/gsp.h"
+#include "gsp/gsp_ck_params.h"
 #endif
 
 /* Debug print rate limiter */
@@ -247,6 +249,12 @@ int main(void)
     HAL_PWM_Init();
     HAL_UART_WriteString("PWM.");
 
+#if FEATURE_IC_ZC && FEATURE_CLC_BLANKING
+    /* 7b. CLC D-FF BEMF blanking — must be after PWM init (needs PWMEVTA) */
+    HAL_CLC_Init();
+    HAL_UART_WriteString("CLC.");
+#endif
+
     /* 8. Timer1 — 50 µs tick for state machine */
     HAL_Timer1_Init();
 
@@ -258,6 +266,12 @@ int main(void)
     /* 8c. SCCP4 commutation timer (hardware-timed commutation) */
     HAL_ComTimer_Init();
     HAL_UART_WriteString("CT.");
+
+#if FEATURE_IC_ZC_CAPTURE
+    /* 8d. SCCP2 input capture for hardware-precise ZC timestamps */
+    HAL_ZcIC_Init();
+    HAL_UART_WriteString("IC.");
+#endif
 #endif
 
     /* 9. Board service + ESC service */
@@ -265,6 +279,7 @@ int main(void)
     GarudaService_Init();
 
 #if FEATURE_GSP
+    CK_ParamsInitDefaults();
     GSP_Init();
 #endif
 

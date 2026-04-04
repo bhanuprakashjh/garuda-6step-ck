@@ -56,11 +56,19 @@ typedef struct {
     uint16_t commDeadline;          /* Timer1 tick for next commutation (fallback) */
     uint16_t forcedCountdown;
     uint16_t goodZcCount;
+    uint16_t checkpointStepPeriod;       /* Per-revolution checkpoint (ESCape32-style) */
+#if FEATURE_IC_ZC
+    uint16_t checkpointStepPeriodHR;    /* HR checkpoint for high-speed desync detection */
+#endif
+    uint8_t  revStepCount;               /* Steps since last revolution checkpoint (0-5) */
     uint8_t  consecutiveMissedSteps;
     uint8_t  stepsSinceLastZc;
     bool     zcSynced;
     bool     deadlineActive;
     bool     hasPrevZc;
+    bool     bypassSuppressed;     /* True from CL entry until first confirmed ZC.
+                                    * Prevents polarity bypass from arming before
+                                    * the estimator has a valid reference. */
 #if FEATURE_IC_ZC
     /* High-resolution timing via SCCP4 free-running timer (640 ns/tick).
      * stepPeriodHR provides 78x better resolution than Timer1-based stepPeriod.
@@ -103,8 +111,68 @@ typedef struct {
     uint16_t diagLcoutAccepted; /* ZCs accepted via ADC ISR backup */
     uint16_t diagFalseZc;       /* Rejected by RecordZcTiming */
     uint16_t diagPollCycles;    /* Total poll ISR invocations */
+    /* Raw comparator edge trace */
+    uint8_t  lastCmpState;      /* previous raw comparator read (0 or 1) */
+    uint16_t stepFlips[6];      /* comparator transitions per step (glitch count) */
+    uint16_t stepPolls[6];      /* total polls per step (for rate calculation) */
+#if FEATURE_IC_ZC_CAPTURE
+    /* SCCP2 IC capture state */
+    uint16_t icCommStamp;       /* SCCP2 timer at last commutation (IC domain) */
+    bool     icArmed;           /* true when IC is armed for capture */
+    uint16_t diagIcAccepted;    /* ZCs accepted via IC capture */
+    uint16_t diagIcBounce;      /* IC fires rejected (bounce after blanking) */
+#endif
 } IC_ZC_STATE_T;
 #endif
+
+/* ── ZC V2 Mode Enum (Phase 1 scaffolding) ──────────────────────────── */
+typedef enum {
+    ZC_MODE_ACQUIRE = 0,   /* CL entry / resync: conservative, building trust */
+    ZC_MODE_TRACK   = 1,   /* Normal CL: strict polarity, tight timing */
+    ZC_MODE_RECOVER = 2    /* Lost sync: wider timeout, no advance, hold duty */
+} ZC_MODE_T;
+
+/* ── ZC Controller State (Phase 2+ populates, Phase 1 declares) ────── */
+typedef struct {
+    ZC_MODE_T mode;
+    uint16_t  acquireGoodCount;    /* consecutive good ZCs in ACQUIRE */
+    uint16_t  recoverGoodCount;    /* consecutive good ZCs in RECOVER */
+    uint8_t   recoverAttempts;     /* RECOVER entries since last stable TRACK */
+    uint16_t  refIntervalHR;      /* protected reference interval (Phase 4+) */
+    uint16_t  rawIntervalHR;      /* last accepted raw interval (Phase 4+) */
+    uint16_t  refIntervalT1;      /* Timer1 protected reference (Phase 4+) */
+    uint16_t  rawIntervalT1;      /* Timer1 raw interval (Phase 4+) */
+    uint16_t  originalTimeoutHR;  /* timeout captured at commutation for latency */
+    uint16_t  demagMetric;        /* demag classification metric (Phase 6+) */
+} ZC_CTRL_T;
+
+/* ── ZC Diagnostics ─────────────────────────────────────────────────── */
+typedef struct {
+    /* Existing (keep for backward compat) */
+    uint8_t  zcLatencyPct;          /* 0-255: ZC window position (0xFF=timeout) */
+    uint16_t lastBlankingHR;        /* Layer 1 blanking applied (HR ticks) */
+    uint16_t diagBypassAccepted;    /* ZCs accepted via polarity bypass (legacy) */
+    uint16_t diagRisingZcCount;     /* ZCs accepted on rising polarity steps */
+    uint16_t diagFallingZcCount;    /* ZCs accepted on falling polarity steps */
+    uint16_t diagIntervalReject;    /* ZC intervals rejected by clamp */
+    /* V2 counters */
+    uint16_t actualForcedComm;      /* ONLY incremented on real timeout-forced comm */
+    uint16_t zcTimeoutCount;        /* total ZC timeouts */
+    uint16_t diagRisingTimeouts;    /* timeouts on rising ZC steps */
+    uint16_t diagFallingTimeouts;   /* timeouts on falling ZC steps */
+    uint16_t diagRisingRejects;     /* false ZCs rejected on rising steps */
+    uint16_t diagFallingRejects;    /* false ZCs rejected on falling steps */
+    /* Per-step 0..5 counters — distinguishes phase-pair vs polarity-class */
+    uint16_t stepAccepted[6];       /* ZCs accepted per commutation step */
+    uint16_t stepTimeouts[6];       /* timeouts per commutation step */
+} ZC_DIAG_T;
+
+/* ── Speed PD Controller State ──────────────────────────────────────── */
+typedef struct {
+    int32_t  override;      /* accumulated duty override (PWM counts) */
+    int32_t  lastError;     /* previous error for derivative */
+    uint32_t targetErpm;    /* from pot mapping (diagnostic) */
+} SPEED_PD_T;
 
 /* Fault codes */
 typedef enum {
@@ -141,6 +209,11 @@ typedef struct {
     uint8_t  desyncRestartAttempts;
     uint32_t recoveryCounter;
 
+    /* GSP throttle override — when gspThrottleActive, potRaw is replaced
+     * with gspThrottleValue in MapThrottleToDuty. GUI motor testing. */
+    bool     gspThrottleActive;
+    uint16_t gspThrottleValue;      /* 0-65535 (same scale as potRaw) */
+
     /* ATA6847 fault monitoring */
     bool     ataFaultPending;       /* Set by Timer1 ISR when nIRQ asserted */
     bool     ataIlimActive;         /* Set when ILIM chopping detected */
@@ -161,6 +234,9 @@ typedef struct {
 #if FEATURE_IC_ZC
     IC_ZC_STATE_T  icZc;
 #endif
+    ZC_DIAG_T      zcDiag;
+    ZC_CTRL_T      zcCtrl;
+    SPEED_PD_T     speedPd;
 
 } GARUDA_DATA_T;
 

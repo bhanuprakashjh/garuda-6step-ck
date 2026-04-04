@@ -37,7 +37,10 @@
 
 /* HR step period above this Timer1 threshold overflows uint16_t.
  * 65535 / 78.125 ≈ 839. Use HR only when stepPeriod < 800. */
-#define HR_MAX_STEP_PERIOD  800U
+#define HR_MAX_STEP_PERIOD  800U  /* HR scheduling for Tp < 800. Required for
+                                    * mid-speed stability (Test B2 confirmed desync
+                                    * without HR at Tp:13). Does NOT fix ZcI
+                                    * alternation — that's comparator offset. */
 
 /**
  * @brief Initialize SCCP4 as free-running timer + output compare.
