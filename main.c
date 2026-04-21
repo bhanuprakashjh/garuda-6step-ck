@@ -29,9 +29,19 @@
 #if FEATURE_IC_ZC
 #include "hal/hal_ic.h"
 #include "hal/hal_com_timer.h"
+#if FEATURE_IC_DMA_SHADOW
+#include "hal/hal_ic_dma.h"
+#endif
 #include "hal/hal_clc.h"
 #endif
+#if FEATURE_PTG_ZC
+#include "hal/hal_ptg.h"
+#endif
 #include "hal/board_service.h"
+#if FEATURE_V4_SECTOR_PI
+#include "motor/sector_pi.h"
+extern volatile ESC_STATE_T gV4State;
+#endif
 #if FEATURE_GSP
 #include "gsp/gsp.h"
 #include "gsp/gsp_ck_params.h"
@@ -47,6 +57,7 @@ static volatile uint32_t lastDebugTick = 0;
 static volatile uint32_t heartbeatCounter = 0;
 #define HEARTBEAT_PERIOD  50000UL  /* main loop iterations (~500ms at 100MHz) */
 
+#if !FEATURE_V4_SECTOR_PI
 static void PrintStatus(void)
 {
     uint32_t interval;
@@ -191,6 +202,7 @@ static void PrintStatus(void)
 
     HAL_UART_NewLine();
 }
+#endif /* !FEATURE_V4_SECTOR_PI */
 
 int main(void)
 {
@@ -249,14 +261,18 @@ int main(void)
     HAL_PWM_Init();
     HAL_UART_WriteString("PWM.");
 
+    /* 8. Timer1 — 50 µs tick for state machine */
+    HAL_Timer1_Init();
+
+#if FEATURE_V4_SECTOR_PI
+    /* V4: sector timer + capture timer init happens in SectorPI_Init() */
+    HAL_UART_WriteString("V4.");
+#else
 #if FEATURE_IC_ZC && FEATURE_CLC_BLANKING
     /* 7b. CLC D-FF BEMF blanking — must be after PWM init (needs PWMEVTA) */
     HAL_CLC_Init();
     HAL_UART_WriteString("CLC.");
 #endif
-
-    /* 8. Timer1 — 50 µs tick for state machine */
-    HAL_Timer1_Init();
 
 #if FEATURE_IC_ZC
     /* 8b. SCCP1 fast poll timer for BEMF ZC detection */
@@ -272,7 +288,20 @@ int main(void)
     HAL_ZcIC_Init();
     HAL_UART_WriteString("IC.");
 #endif
+
+#if FEATURE_IC_DMA_SHADOW
+    /* 8d-alt. Dual-CCP + DMA shadow ring (experiment). */
+    HAL_ZcDma_Init();
+    HAL_UART_WriteString("DMA.");
 #endif
+#endif
+
+#if FEATURE_PTG_ZC
+    /* 8e. PTG edge-relative BEMF sampling */
+    HAL_PTG_Init();
+    HAL_UART_WriteString("PTG.");
+#endif
+#endif /* !FEATURE_V4_SECTOR_PI */
 
     /* 9. Board service + ESC service */
     BoardServiceInit();
@@ -286,6 +315,13 @@ int main(void)
     HAL_UART_WriteString("OK");
     HAL_UART_NewLine();
 
+#if FEATURE_V4_SECTOR_PI
+    HAL_UART_WriteString("V4 Sector PI — MPER=");
+    HAL_UART_WriteU16(LOOPTIME_TCY);
+    HAL_UART_WriteString(" InitSector=");
+    HAL_UART_WriteU16(V4_ERPM_TO_PERIOD(V4_STARTUP_SPEED_ERPM));
+    HAL_UART_NewLine();
+#else
     /* Print computed constants for verification */
     HAL_UART_WriteString("MPER=");
     HAL_UART_WriteU16(LOOPTIME_TCY);
@@ -306,6 +342,7 @@ int main(void)
     HAL_UART_WriteString(" RampCap=");
     HAL_UART_WriteU16(RAMP_DUTY_CAP);
     HAL_UART_NewLine();
+#endif
 
     HAL_UART_WriteString("PLL LOCK=");
     HAL_UART_WriteByte(OSCCONbits.LOCK ? '1' : '0');
@@ -325,6 +362,35 @@ int main(void)
     while (1)
     {
         BoardService();
+
+#if FEATURE_V4_SECTOR_PI
+        /* V4: pot/Vbus polled in ADC ISR continuously */
+
+#if !FEATURE_GSP
+        if (HAL_UART_IsRxReady())
+        {
+            uint8_t cmd = HAL_UART_ReadByte();
+            DIAG_ProcessCommand(cmd);
+        }
+#endif
+
+        if (IsPressed_Button1())
+        {
+            if (gV4State == ESC_IDLE)
+                GarudaService_StartMotor();
+        }
+        if (IsPressed_Button2())
+            GarudaService_StopMotor();
+
+        heartbeatCounter++;
+        if (heartbeatCounter >= HEARTBEAT_PERIOD)
+        {
+            heartbeatCounter = 0;
+            if (gV4State == ESC_IDLE)
+                LED_RUN ^= 1;
+        }
+
+#else /* V3 */
 
         /* Poll pot/Vbus via software trigger during IDLE (no PWM triggers) */
         if (gData.state == ESC_IDLE)
@@ -387,6 +453,7 @@ int main(void)
             if (gData.state == ESC_IDLE)
                 LED_RUN ^= 1;   /* toggle ~1Hz blink */
         }
+#endif /* !FEATURE_V4_SECTOR_PI */
 
         /* Housekeeping */
         GarudaService_MainLoop();

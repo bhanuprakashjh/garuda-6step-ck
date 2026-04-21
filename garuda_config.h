@@ -14,7 +14,7 @@
 
 /* ── Motor Profile Selection ──────────────────────────────────────── */
 #ifndef MOTOR_PROFILE
-#define MOTOR_PROFILE   2   /* 0=Hurst, 1=A2212, 2=2810 */
+#define MOTOR_PROFILE   1   /* 0=Hurst, 1=A2212, 2=2810 */
 #endif
 
 /* ── Clock ─────────────────────────────────────────────────────────── */
@@ -23,12 +23,15 @@
 #define FOSC_PWM_MHZ        400U         /* PWM timing base (CK: 2x Fosc) */
 
 /* ── PWM ───────────────────────────────────────────────────────────── */
-#define PWMFREQUENCY_HZ     24000U       /* 24 kHz (AM32 default). Inaudible.
-                                          * 15kHz gave 19x fewer ZC timeouts
-                                          * but was audible. 24kHz should give
-                                          * cleaner ZC than 20kHz while staying
-                                          * above hearing. Aliasing at 72k eRPM
-                                          * (was 60k at 20kHz). */
+#define PWMFREQUENCY_HZ     40000U       /* 40 kHz — proven baseline reaching
+                                          * 124k eRPM at 56% duty with
+                                          * complementary drive + midpoint ZC.
+                                          * 20 kHz tested: marginally better at
+                                          * low duty, worse at high duty due to
+                                          * doubled current ripple. Discarded.
+                                          * Higher headroom now requires ZC
+                                          * detection improvements (PI, deglitch,
+                                          * blanking, EGBLT). */
 #define LOOPTIME_MICROSEC   (uint16_t)(1000000UL / PWMFREQUENCY_HZ)  /* 50 us */
 #define LOOPTIME_TCY        (uint16_t)((uint32_t)LOOPTIME_MICROSEC * FOSC_PWM_MHZ / 2 - 1)
 /* PWM drive mode: complementary vs unipolar.
@@ -220,11 +223,11 @@
  * Low Rs (50mΩ) means high current at moderate duty.
  * At 13V, 5% duty → I = 0.05 × 13 / 0.050 = 13A peak (brief ramp). */
 #define ALIGN_TIME_MS       200U
-#define ALIGN_DUTY          (LOOPTIME_TCY / 40)    /* ~2.5% duty */
+#define ALIGN_DUTY          (LOOPTIME_TCY / 20)    /* ~5% for 40kHz (CCPT overhead) */
 #define INITIAL_STEP_PERIOD 1000U        /* Timer1 ticks (50ms = ~200 eRPM) */
 #define MIN_STEP_PERIOD     50U          /* Timer1 ticks (2.5ms = ~4000 eRPM) */
 #define RAMP_ACCEL_ERPM_S   500U         /* eRPM/s — moderate, proven on this motor */
-#define RAMP_DUTY_CAP       (LOOPTIME_TCY / 15)    /* Max ~7% duty during OL ramp */
+#define RAMP_DUTY_CAP       (LOOPTIME_TCY / 8)     /* ~12.5% for 40kHz */
 
 /* ZC Detection */
 #define ZC_BLANKING_PERCENT 20U          /* For OL_RAMP ADC backup poll only.
@@ -240,7 +243,13 @@
 #define ZC_BLANK_CAP_PCT    45U         /* Max blanking as % of step period */
 #define FEATURE_IC_ZC_ADAPTIVE 1        /* Enable adaptive blanking for 2810 */
 
-/* Timing advance: uses shared TIMING_ADVANCE_LEVEL default (15°) */
+/* Timing advance: level 3 (22.5°) for 2810 at 24V.
+ * Level 3 vs 2 bench test: speed wall at ~100k is detector-latency-
+ * limited (target-past >75% above 90k), not advance-limited.
+ * Level 3 kept for now — does not hurt sub-90k operation and
+ * provides slightly more margin in the 60-90k band.
+ * Next step: scan-window state machine for earlier accepted timestamps. */
+#define TIMING_ADVANCE_LEVEL 3U
 
 /* Closed-Loop
  * At 25.2V (6S full): 1350 × 25.2 = 34020 RPM = 238k eRPM theoretical.
@@ -352,6 +361,17 @@
 #define FEATURE_IC_ZC_ADAPTIVE  0
 #endif
 
+/* Speed-adaptive detector front end threshold.
+ * Below this StpHR: switch from CLC D-FF to raw GPIO (inverted) for
+ * BEMF reads. CLC updates once per PWM (42µs at 24kHz) — at high speed,
+ * the CLC may show stale pre-ZC state if its update falls in blanking.
+ * Raw GPIO updates every poll (4.75µs at 210.5kHz), 9x faster.
+ * BEMF is strong at high speed → raw GPIO noise is manageable.
+ * 250 HR = 160µs = ~62k eRPM. Below 62k: CLC. Above 62k: raw GPIO. */
+#ifndef ZC_IC_DIRECT_THRESHOLD_HR
+#define ZC_IC_DIRECT_THRESHOLD_HR  250U
+#endif
+
 /* Bypass guard bounds (used when FEATURE_IC_ZC_ADAPTIVE=1) */
 #define ZC_BYPASS_LO_PCT    40U     /* Min % of stepPeriodHR for bypass acceptance */
 #define ZC_BYPASS_HI_PCT   160U     /* Max % of stepPeriodHR for bypass acceptance */
@@ -407,12 +427,558 @@
 #define FEATURE_IC_ZC_CAPTURE   1   /* Hybrid IC+poll: IC timestamp, poll validates */
 #endif
 
+#ifndef FEATURE_IC_DMA_SHADOW
+#define FEATURE_IC_DMA_SHADOW   1   /* Dual-CCP + DMA shadow ring experiment.
+                                     * When 1: CCP2 (rising ZCs) and CCP5 (falling ZCs)
+                                     *  run as free-running input captures with DMA0/DMA1
+                                     *  writing hardware-precise timestamps to circular
+                                     *  RAM rings. A per-step probe compares DMA captures
+                                     *  against the poll-accepted ZC and logs telemetry.
+                                     *  Shadow-only: does NOT affect live scheduling.
+                                     * When 0: no DMA, no CCP5, production path unchanged.
+                                     * MUTUALLY EXCLUSIVE with FEATURE_IC_ZC_CAPTURE — under
+                                     * the shadow flag the live CCP2 path is stubbed so
+                                     * DMA owns CCP2BUFL drains exclusively. */
+#endif
+
+#if FEATURE_IC_DMA_SHADOW && FEATURE_IC_ZC_CAPTURE
+#undef  FEATURE_IC_ZC_CAPTURE
+#define FEATURE_IC_ZC_CAPTURE   0   /* Shadow takes exclusive ownership of CCP2 */
+#endif
+
+/* ── Sector PI synchronizer (FEATURE_SECTOR_PI) ────────────────────
+ * New high-speed control path modeled on Microchip AVR high-speed
+ * example. Uses hardware-captured ZC (DMA ring) + PI on phase error
+ * + explicit fixed detector delay + explicit torque advance.
+ *
+ * Does NOT modify the reactive poll-timed path. Runs in shadow
+ * first (mode=1), then takes ownership (mode=2) at high speed.
+ * Reactive path stays as fallback.
+ *
+ * Requires FEATURE_IC_DMA_SHADOW. */
+#ifndef FEATURE_SECTOR_PI
+#define FEATURE_SECTOR_PI        1
+#endif
+
+/* Detector delay: sum of three fixed hardware pipeline components.
+ * Precomputed to integer HR ticks (640 ns each). No float in hot path.
+ *
+ * ATA6847 comparator propagation:  ~2 µs → 3 HR ticks
+ * RC filter on phase inputs:       ~0 µs → 0 HR ticks (CK board has CLC, no RC)
+ * DMA cluster selector bias:       ~1 µs → 2 HR ticks (midpoint vs true edge) */
+#ifndef ZC_EXTCMP_DELAY_HR
+/* Detector delay components in HR ticks (640 ns each).
+ *
+ * Measured from CSV pot_capture_20260414_175759.csv:
+ * T_hat gap is consistently -24 to -27 HR in the 26-60k band
+ * where acceptance is 99% and the motor runs cleanly.
+ * This gap = true detector delay not accounted for in the model.
+ *
+ * ATA6847 comparator propagation:       ~2 µs →  3 HR
+ * Poll filter delay (multi-read):       ~10 µs → 16 HR
+ * DMA cluster bias (midpoint vs edge):  ~1 µs →  2 HR
+ * Poll-to-DMA offset residual:          ~2 µs →  4 HR
+ * Total:                                ~15 µs   25 HR */
+#define ZC_EXTCMP_DELAY_HR       3U
+#endif
+#ifndef ZC_RC_DELAY_HR
+#define ZC_RC_DELAY_HR           0U
+#endif
+#ifndef ZC_CLUSTER_BIAS_HR
+#define ZC_CLUSTER_BIAS_HR       2U
+#endif
+#ifndef ZC_POLL_FILTER_DELAY_HR
+#define ZC_POLL_FILTER_DELAY_HR  20U   /* DMA captures ZC ~25 HR BEFORE poll.
+                                        * This is SUBTRACTED from setValueHR
+                                        * (not added) because the DMA measurement
+                                        * is EARLY, unlike Microchip's RC filter
+                                        * which makes measurements LATE. */
+#endif
+#define ZC_SYNC_DET_DELAY_HR     (ZC_EXTCMP_DELAY_HR + ZC_RC_DELAY_HR + ZC_CLUSTER_BIAS_HR + ZC_POLL_FILTER_DELAY_HR)
+
+/* Torque advance: pure motor-dependent angle (electrical degrees).
+ * 10° is the Microchip default for similar KV motors (A2207-2500KV).
+ * NOT mixed with detector latency. Converted to HR ticks at runtime
+ * using integer multiply: advHR = (deg * 256 / 60) * T_hatHR >> 8.
+ * The constant below is the fixed-point multiplier (deg * 256 / 60). */
+#ifndef ZC_SYNC_ADVANCE_DEG
+#define ZC_SYNC_ADVANCE_DEG      10.0f
+#endif
+#define ZC_SYNC_ADVANCE_FP8      ((uint16_t)(ZC_SYNC_ADVANCE_DEG * 256.0f / 60.0f + 0.5f))
+
+/* PI gains (bit shifts for division).
+ * Kp = 1/4: fast transient response to speed changes.
+ * Ki = 1/16: smooth long-term frequency tracking.
+ * Matches Microchip example: motor.c lines 444 (>>4) and 448 (>>2). */
+#ifndef ZC_SYNC_KP_SHIFT
+#define ZC_SYNC_KP_SHIFT         2
+#endif
+#ifndef ZC_SYNC_KI_SHIFT
+#define ZC_SYNC_KI_SHIFT         4
+#endif
+
+/* Speed thresholds with hysteresis.
+ * Entry at 60k: above TAL transition zone, DMA has data.
+ * Exit at 50k: below DMA threshold, poll is reliable. */
+#ifndef ZC_SYNC_ENTRY_ERPM
+#define ZC_SYNC_ENTRY_ERPM       26000UL  /* Lowered for debugging: get PI
+                                           * measurements at lower speed where
+                                           * reactive margin is positive and
+                                           * motor runs cleanly. */
+#endif
+#ifndef ZC_SYNC_EXIT_ERPM
+#define ZC_SYNC_EXIT_ERPM        20000UL
+#endif
+
+/* Corridor half-width for DMA cluster selection.
+ * Clusters outside expectedHR ± corridor are rejected.
+ * Default: T_hatHR/4 (±15° = ±25% of sector period). */
+#ifndef ZC_SYNC_CORRIDOR_DIV
+#define ZC_SYNC_CORRIDOR_DIV     4
+#endif
+
+#ifndef FEATURE_REACTIVE_LATENCY_SPLIT
+#define FEATURE_REACTIVE_LATENCY_SPLIT  0  /* DISABLED — experiment proved that
+                                            * splitting TAL in the reactive path
+                                            * doesn't help without also changing
+                                            * the measurement source. The sector
+                                            * PI synchronizer (FEATURE_SECTOR_PI)
+                                            * handles advance/delay separation
+                                            * in a new control path instead. */
+#endif
+
+#ifndef REACTIVE_LATENCY_COMP_LEVELS
+#define REACTIVE_LATENCY_COMP_LEVELS  1U   /* Only used when FEATURE_REACTIVE_LATENCY_SPLIT=1 */
+#endif
+
+#ifndef FEATURE_DMA_ZC_DIRECT
+#define FEATURE_DMA_ZC_DIRECT   0   /* DISABLED — selector is validated but live
+                                     * deployment not production-ready.
+                                     *
+                                     * The selector ("last ≥2-edge cluster before
+                                     * poll, return midpoint") is sound: 1.3–7 µs
+                                     * stdev, <3 µs polarity split, validated
+                                     * offline across 25–90k eRPM with and without
+                                     * prop. See memory/ck_bemf_signal_physics.md.
+                                     *
+                                     * The reactive scheduler now has an explicit
+                                     * latency-compensation term, but live DMA
+                                     * substitution is still off until bench data
+                                     * confirms the split is calibrated well enough
+                                     * to replace poll timing in the hot path. */
+#endif
+
+#if FEATURE_DMA_ZC_DIRECT && !FEATURE_IC_DMA_SHADOW
+#error "FEATURE_DMA_ZC_DIRECT requires FEATURE_IC_DMA_SHADOW"
+#endif
+
+#ifndef FEATURE_DMA_BURST_CAPTURE
+#define FEATURE_DMA_BURST_CAPTURE  1   /* Research tool: one-shot capture of
+                                        * DMA raw edge sequences for 12
+                                        * consecutive commutation steps.
+                                        * Armed via GSP command; motor runs
+                                        * unaffected. Cost: ~600 bytes .bss */
+#endif
+
+#if FEATURE_DMA_BURST_CAPTURE && !FEATURE_IC_DMA_SHADOW
+#error "FEATURE_DMA_BURST_CAPTURE requires FEATURE_IC_DMA_SHADOW"
+#endif
+
+#ifndef FEATURE_6STEP_DPLL
+#define FEATURE_6STEP_DPLL  1       /* 6-step event DPLL for commutation.
+                                     * When 1: a digital PLL tracks rotor
+                                     * phase from ZC events and owns
+                                     * commutation scheduling at high speed.
+                                     * Separates T_hat (period), phaseBiasHR
+                                     * (measurement bias), and advanceCmdHR
+                                     * (torque advance) — the reactive path's
+                                     * delayHR = halfHR - advHR tangles them.
+                                     *
+                                     * V1: t_meas = pollHR (no DMA).
+                                     * V2: t_meas = DMA cluster midpoint.
+                                     *
+                                     * Requires FEATURE_IC_ZC. */
+#endif
+
+/* DPLL handoff speed threshold. Predictive mode only engages above
+ * this eRPM. Below this, reactive poll scheduling is sufficient. */
+#ifndef DPLL_HANDOFF_ERPM
+#define DPLL_HANDOFF_ERPM   200000UL  /* Shadow-only. Predictive ownership
+                                       * causes limit cycle: T_hat drift →
+                                       * phase error → exit → re-enter.
+                                       * Need T_hat to track actual period
+                                       * during ownership before enabling. */
+#endif
+
+/* DMA-primary ZC detection: above the speed threshold, FastPoll
+ * queries the DMA ring for qualifying edge clusters instead of
+ * reading the comparator GPIO with multi-read filtering.
+ *
+ * Eliminates ~16 µs of poll filter latency. The DMA ring already
+ * has hardware-precise timestamps of every comparator edge.
+ * Poll ISR becomes a DMA consumer, not a GPIO sampler.
+ *
+ * Window: open = max(blankingEnd, 50% gate), close = now.
+ * Cluster: ≥2 edges within DMA_DETECT_GAP_HR (6.4 µs).
+ * Fallback: if no qualifying cluster by late bound, fall through
+ *           to the existing poll/raw path.
+ *
+ * Requires FEATURE_IC_DMA_SHADOW. */
+#ifndef FEATURE_DMA_PRIMARY_ZC
+#define FEATURE_DMA_PRIMARY_ZC   0    /* DISABLED: DMA timestamp is ~20 HR
+                                       * earlier than poll. Reactive scheduling
+                                       * now separates detector latency from
+                                       * torque advance, but DMA-primary still
+                                       * stays off until the new split is bench-
+                                       * tuned and validated across the 50-100k
+                                       * eRPM band. */
+#endif
+
+/* Speed threshold for DMA-primary ZC and DMA-direct substitution.
+ * Expressed as stepPeriodHR (HR ticks per commutation step).
+ * 15,625,000 HR ticks/sec ÷ 312 ≈ 50,080 eRPM.
+ * Lower (smaller) stepPeriodHR means FASTER motor → gate opens. */
+#ifndef DMA_ZC_DIRECT_THRESHOLD_HR
+#define DMA_ZC_DIRECT_THRESHOLD_HR    312u   /* enable above ~50k eRPM */
+#endif
+
+/* Max absolute |refinedHR - pollHR| allowed. Outside this, the DMA
+ * edge is considered unrelated and poll is used unchanged. 300 HR
+ * ticks = ~192 μs — covers the worst observed poll latency. */
+#ifndef DMA_ZC_DIRECT_MAX_CORRECTION_HR
+#define DMA_ZC_DIRECT_MAX_CORRECTION_HR  300u
+#endif
+
+/* Speed-adaptive bias added to the refined timestamp AFTER
+ * substitution. Compensates for the advance shift caused by moving
+ * lastZcTickHR earlier. The measured backdate is speed-dependent:
+ *   ~22 HR at 30-50k eRPM (stepHR ~312)
+ *   ~24 HR at 50-60k       (stepHR ~260)
+ *   ~27 HR at 60-70k       (stepHR ~220)
+ *   ~29 HR at 70-90k       (stepHR ~195)
+ * A linear fit:
+ *   bias = BASE + (THRESHOLD - stepHR) / SLOPE
+ * maps these points well. */
+#ifndef DMA_ZC_DIRECT_BIAS_BASE_HR
+#define DMA_ZC_DIRECT_BIAS_BASE_HR     22u   /* bias at threshold crossing */
+#endif
+#ifndef DMA_ZC_DIRECT_BIAS_SLOPE
+#define DMA_ZC_DIRECT_BIAS_SLOPE       17u   /* HR ticks of stepHR per +1 bias */
+#endif
+
+#ifndef FEATURE_PRED_WINDOW_GATE
+#define FEATURE_PRED_WINDOW_GATE 0  /* PLL predictor scan window gate.
+                                     * When gateActive (12 consecutive locked+in-window),
+                                     * veto ZC candidates outside the predicted scan window.
+                                     * On veto: clear candidate, continue scanning same step.
+                                     * Self-disarms on timeout or 2+ rejects/revolution. */
+#endif
+
+#ifndef FEATURE_PTG_ZC
+#define FEATURE_PTG_ZC          0   /* PTG edge-relative BEMF sampling.
+                                     * 0 = disabled (CLC D-FF only — proven working)
+                                     * 1 = PTG supplements CLC: reads raw GPIO at
+                                     *     fixed delay after switching edge.
+                                     *     Fixes duty-dependent CLC clock position
+                                     *     issue at 50%/80% duty. */
+#endif
+#if FEATURE_PTG_ZC
+#define PTG_DELAY_US            7U  /* Delay after switching edge (µs).
+                                     * Must be > ATA6847 comparator settling (~3µs)
+                                     * and > edge blanking (EGBLT=3.75µs at max).
+                                     * 7µs gives margin. Increase to 10µs at 24V
+                                     * if ringing is still visible. */
+#define PTG_BTE_BIT             9U  /* PTGBTE bit for PG1 ADC Trigger 2 (TRIGB).
+                                     * Device-specific — verify against DS70005178
+                                     * Table 2 for dsPIC33CK64MP205.
+                                     * If PTG doesn't trigger: try 1, 2, or 8. */
+#endif
+
 #ifndef FEATURE_GSP
 #define FEATURE_GSP             1   /* 1 = GSP binary protocol on UART1 (disables debug prints)
                                      * 0 = debug UART text output (default for development)
                                      * Set to 1 when using GUI or gsp_ck_test.py */
 #endif
 
+/* ── V4 Sector PI Architecture ────────────────────────────────────────
+ * Ground-up rewrite modeled on Microchip AVR high-speed motor control.
+ * Two timers + one PI. No poll, no DMA, no reactive/predictive modes.
+ * SCCP3 = sector timer (periodic, fires commutation ISR).
+ * CCP2  = capture timer (IC mode, ISR drains FIFO, last edge wins).
+ * PI always owns commutation scheduling from startup onward.
+ *
+ * When FEATURE_V4_SECTOR_PI=1, ALL V3 motor control code is gated off:
+ * FEATURE_IC_ZC, FEATURE_CLC_BLANKING, FEATURE_IC_DMA_SHADOW, etc.
+ * are ignored. Only V4 files compile. V3 code remains for fallback
+ * (set FEATURE_V4_SECTOR_PI=0 to restore V3). */
+#ifndef FEATURE_V4_SECTOR_PI
+#define FEATURE_V4_SECTOR_PI    1
+#endif
+
+#if FEATURE_V4_SECTOR_PI
+
+/* Motor phase advance (electrical degrees, 0..30).
+ * 10° is Microchip default for similar KV motors (A2207-2500KV). */
+#define V4_PHASE_ADVANCE_DEG    10.0f
+
+/* Board detector delay (µs). ATA6847 comparator propagation ~2 µs.
+ * CK board has no RC filter on BEMF inputs (unlike Microchip MPPB
+ * which has 10 µs RC delay). */
+#define V4_RC_DELAY_US          2.0f
+
+/* Pre-computed constants (compile-time, no float in hot path) */
+#define V4_ADVANCE_PLUS_30_FP8  ((uint16_t)((V4_PHASE_ADVANCE_DEG + 30.0f) * 256.0f / 60.0f + 0.5f))
+#define V4_RC_DELAY_HR          ((uint16_t)(V4_RC_DELAY_US * 1.5625f + 0.5f))
+
+/* PI gains (bit shifts). Matches Microchip AVR motor.c:444,448. */
+#define V4_KP_SHIFT             2       /* Kp = 1/4 */
+#define V4_KI_SHIFT             4       /* Ki = 1/16 */
+
+/* Startup */
+#if MOTOR_PROFILE == 0   /* Hurst */
+#define V4_STARTUP_SPEED_ERPM   3000UL
+#define V4_STARTUP_CURRENT_MA   2000.0f
+#define V4_ALIGN_DURATION_MS    200U
+#elif MOTOR_PROFILE == 1  /* A2212 */
+#define V4_STARTUP_SPEED_ERPM   500UL
+#define V4_STARTUP_CURRENT_MA   3000.0f
+#define V4_ALIGN_DURATION_MS    100U
+#elif MOTOR_PROFILE == 2  /* 2810 */
+#define V4_STARTUP_SPEED_ERPM   500UL
+#define V4_STARTUP_CURRENT_MA   3000.0f
+#define V4_ALIGN_DURATION_MS    100U
+#endif
+
+#define V4_STARTUP_TIME_MS      1000U   /* Forced ramp duration before commands accepted */
+#define V4_STALL_THRESHOLD      200U    /* Consecutive no-capture sectors → stall.
+                                         * At 3000 eRPM: 200 sectors ≈ 0.4s */
+#define V4_MIN_PERIOD           10U     /* Timer period floor (~1.5M eRPM, safety) */
+
+/* Sector timer clock: same as SCCP4 HR timer */
+#define V4_TIMER_FREQ_HZ        (FCY / 64UL)   /* 1,562,500 Hz = 640 ns/tick */
+#define V4_ERPM_TO_PERIOD(e)    (uint16_t)(60UL * V4_TIMER_FREQ_HZ / (6UL * (e)))
+
+/* ISR priorities */
+#define V4_SECTOR_ISR_PRIORITY  6       /* Commutation — highest motor ISR */
+#define V4_CAPTURE_ISR_PRIORITY 5       /* ZC edge capture — below sector */
+
+/* ZC detection method:
+ * 0 = CCP edge capture + 3-read deglitch. Tested 2026-04-16: same 49%
+ *     Cap% as Mode 1, but motor desynced at ~110k eRPM. The deglitch
+ *     state-check convention in CCP2/CCP5 ISRs (garuda_service.c) is
+ *     suspect — appears to be checking pre-edge state instead of
+ *     post-edge state, which would mean the only Sets that fire are on
+ *     comparator noise spikes rather than real ZCs.
+ * 1 = PWM-midpoint sampling in ADC ISR. Reaches 196k eRPM stably with
+ *     49% Cap% (rising sectors only — falling sectors past blanking
+ *     never see a stable comp state, ATA6847 has no hysteresis and
+ *     falling-sector BEMF hovers near neutral). PROVEN BASELINE.
+ * 2 = Hybrid: ADC midpoint confirms ZC state, CCP provides accurate
+ *     timestamp. Mask CCP after acceptance like AM32. Untested in V4. */
+#define FEATURE_V4_MIDPOINT_ZC  1
+
+/* ── V5 Symmetric Sensing (architecture gate, default off) ────────
+ * V4 hits a wall because only rising sectors produce real captures.
+ * V5 is the symmetric-sensing rewrite: both polarities feed the PI
+ * with matching signal quality.
+ *
+ * FEATURE_V5_SYMMETRIC_SENSING=0 → byte-identical to V4 baseline.
+ * FEATURE_V5_SYMMETRIC_SENSING=1 → V5 code paths active.
+ *
+ * V5.0 attempt 1 (2026-04-18): SCCP1 priority 2 → 5. Hypothesis was
+ * that the OFF-mid diagnostic ISR was starved by CCP storm during
+ * falling sectors. Bench result: NO measurable improvement in
+ * offMidCapture / offMidMismatch counters between priority 2 and 5.
+ * The bottleneck isn't CPU budget — SCCP1 was already firing ~10 kHz
+ * at priority 2. The real issue is SCCP1's 24.96 µs clock aliasing
+ * against the commutation cadence such that fires never land in
+ * sector windows where currentRisingZc == false. Priority can't fix
+ * that. The V5_SCCP1_ISR_PRIORITY knob is kept for reference only.
+ *
+ * V5.0 attempt 2 (active direction): PTG-based BEMF sampling. A
+ * core-independent state machine fires ADC/GPIO samples at
+ * programmable delays from the PWM trigger, one offset per sector
+ * polarity, with hardware-exact timing and zero CPU jitter. This
+ * is the right tool for per-sector sample timing — the sampling
+ * problem can't be solved in software polling. */
+#ifndef FEATURE_V5_SYMMETRIC_SENSING
+#define FEATURE_V5_SYMMETRIC_SENSING  0
+#endif
+
+#if FEATURE_V5_SYMMETRIC_SENSING
+#define V5_SCCP1_ISR_PRIORITY   5  /* archived: tied with CCP, no effect */
+#else
+#define V5_SCCP1_ISR_PRIORITY   2  /* V4 baseline: below ADC */
+#endif
+
+/* ── V5.0-PTG: Peripheral Trigger Generator BEMF sampling ────────
+ * Core-independent state machine triggers per-sector BEMF reads at
+ * hardware-exact offsets from the PWM valley event. This is the real
+ * V5.0 approach — the SCCP1 priority experiment is archived.
+ *
+ * PTG command queue (FEATURE_V5_PTG_ZC=1):
+ *   STEP0: PTGWHI | 0x1         wait for PWM trigger input
+ *   STEP1: PTGCTRL| 0x8         start PTGT0, wait for timeout
+ *   STEP2: PTGIRQ | 0x0         generate PTG0 interrupt (_PTG0Interrupt)
+ *   STEP3: PTGJMP | 0x0         loop back to STEP0
+ *
+ * PTG clock = FCY (100 MHz) / PTGDIV. PTGDIV=0 → 100 MHz, 10 ns/tick.
+ * PTGT0LIM sets the delay-from-PWM-trigger in PTG ticks.
+ *
+ * Per-sector sample offset (rewritten by Commutate ISR):
+ *   rising sector → PTGT0LIM = 0         (sample at valley, ~existing behavior)
+ *   falling sector → PTGT0LIM = MPER/2*N (sample at PWM peak / OFF-mid)
+ *
+ * When FEATURE_V5_PTG_ZC=0: byte-identical to V4 baseline.
+ * When =1: PTG init runs at motor start, ISR counts samples (shadow
+ *          only in V5.0-step1 — does NOT set v4_captureValid). */
+#ifndef FEATURE_V5_PTG_ZC
+#define FEATURE_V5_PTG_ZC  1
+#endif
+
+/* PTG ISR priority — above ADC(3), tied with Timer1(4), below CCP(5).
+ * Started at 5 (tied with CCP) but bench showed peak speed dropped to
+ * ~62k from V4's 107k — the PTG-CCP same-level queue was slowing CCP
+ * servicing under high-speed comparator chatter. Priority 4 lets CCP
+ * preempt PTG so CCP processing isn't held up; PTG still preempts ADC. */
+#define V5_PTG_ISR_PRIORITY  4
+
+/* ── V5.1 Symmetric ADC accept (post-ZC convention) ──────────────
+ * The V4 ADC ISR uses `expected = isRising ? 1 : 0` — this is the
+ * pre-ZC state for both polarities (rising sector pre-ZC has comp=1,
+ * falling sector pre-ZC has comp=0 on the inverted ATA6847 comp).
+ * V4 only ever accepts captures in rising sectors because the
+ * pre-ZC sample for falling sectors lands too late within the sector
+ * and gets rejected by the half-period filter in Commutate.
+ *
+ * V5.1 flips the convention to post-ZC sampling: accept when
+ *   rising  sector → comp == 0
+ *   falling sector → comp == 1
+ * The PTG diagnostic data showed both polarities have ~67% post-ZC
+ * accept rate at PWM valley sampling — strong, observable signal on
+ * both. With the convention flipped, the ADC ISR should accept on
+ * both polarities and feed the PI ~2× more captures, hopefully
+ * collapsing the 2× equilibrium offset (eTP ≈ eRpm/2) to truth.
+ *
+ * V5.1-step1 (FEATURE_V5_POST_ZC_ACCEPT=1, FEATURE_V5_POST_ZC_OWN=0):
+ *   Shadow only — V4 convention still drives v4_captureValid; new
+ *   counters report what post-ZC accept would do.
+ * V5.1-step2 (FEATURE_V5_POST_ZC_OWN=1):
+ *   Post-ZC accept actually drives v4_captureValid; PI sees both
+ *   polarities. Bench-validate PI stability before this. */
+#ifndef FEATURE_V5_POST_ZC_ACCEPT
+#define FEATURE_V5_POST_ZC_ACCEPT  0
+#endif
+
+#ifndef FEATURE_V5_POST_ZC_OWN
+#define FEATURE_V5_POST_ZC_OWN     0   /* requires FEATURE_V5_POST_ZC_ACCEPT */
+#endif
+
+#if FEATURE_V5_POST_ZC_OWN && !FEATURE_V5_POST_ZC_ACCEPT
+#error "FEATURE_V5_POST_ZC_OWN requires FEATURE_V5_POST_ZC_ACCEPT"
+#endif
+
+/* ── V5.2 Measurement-based PI ─────────────────────────────────
+ * V4's set-point PI converges to a wrong equilibrium (eTP ≈ eRpm/2)
+ * and collapses to its floor when capture timing semantics change
+ * (e.g., PTG sampling, hardware edge captures). Root cause: the
+ * setValue formula models a specific capture convention (first
+ * pre-ZC sample after blanking), so any sensor that delivers data
+ * with different statistics breaks the equilibrium search.
+ *
+ * V5.2 fix: replace `timerPeriod ← integrator + delta/4` with a
+ * simple exponential smoother on the measured commutation interval:
+ *   v5_tMeasHR += (actualStepPeriodHR - v5_tMeasHR) >> alpha_shift
+ *
+ * This tracks T_real directly and doesn't care about the capture
+ * sample moment. The reactive scheduler still uses capture
+ * timestamps for *when* to commutate; the period estimate becomes
+ * truly independent of what the ZC sensor delivers.
+ *
+ * V5.2-step1 (FEATURE_V5_MEAS_PI=1, FEATURE_V5_MEAS_PI_OWN=0):
+ *   Shadow only — v5_tMeasHR updates in parallel with the set-point
+ *   PI, exposed via telemetry (eTPm column). Compare eTPm to eRpm:
+ *   if eTPm tracks eRpm while eTP (set-point PI) shows half, the
+ *   measurement tracker is correct.
+ * V5.2-step2 (FEATURE_V5_MEAS_PI_OWN=1):
+ *   v5_tMeasHR actually drives timerPeriod. Set-point PI bypassed.
+ *   Reactive scheduling and everything downstream reads the new
+ *   value. With OWN=1 + PTG, we finally get symmetric captures on a
+ *   PI that tracks truth.
+ *
+ * Alpha shift 2 (= 1/4) mirrors V4's Ki choice. Higher shifts
+ * smooth more (slower response to speed changes); lower shifts
+ * track tighter but are noisier. */
+#ifndef FEATURE_V5_MEAS_PI
+#define FEATURE_V5_MEAS_PI  1
+#endif
+
+#ifndef FEATURE_V5_MEAS_PI_OWN
+#define FEATURE_V5_MEAS_PI_OWN  0   /* requires FEATURE_V5_MEAS_PI */
+#endif
+
+#if FEATURE_V5_MEAS_PI_OWN && !FEATURE_V5_MEAS_PI
+#error "FEATURE_V5_MEAS_PI_OWN requires FEATURE_V5_MEAS_PI"
+#endif
+
+#ifndef V5_MEAS_PI_ALPHA_SHIFT
+#define V5_MEAS_PI_ALPHA_SHIFT  2    /* α = 1/4, matches V4 Ki shift */
+#endif
+
+/* ── V5.3 scheduler rewrite (AM32-style) ────────────────────────
+ * Root cause of everything V5.0/V5.1/V5.2 hit: the V4 set-point PI
+ * scheduler fires Commutates in PAIRS — one reactive (ASAP, because
+ * lastCaptureHR + delayHR is always slightly past) and one fallback
+ * (2T later). Over each 2T wallclock, it runs 2 Commutates and
+ * advances position by 2. Software state isn't 1:1 with the
+ * physical rotor sector, which breaks any per-sector reasoning
+ * (eTP=eRpm/2, PTG bucket skew, can't use captures on falling
+ * sectors).
+ *
+ * V5.3 architecture:
+ *   - One Commutate per physical sector (6 per elec rev).
+ *   - Commutate fires at lastCaptureHR + (T_sector/2 - advance).
+ *   - T_sector = thisCaptureHR - prevCaptureHR (capture-to-capture,
+ *     one sector apart — not 2x like V4's measuredCommPeriod).
+ *   - Both CCP2 (rising) and CCP5 (falling) feed captures. PTG
+ *     provides the back-up polarity discriminator.
+ *   - position advances once per Commutate, tracking physical
+ *     rotor sectors 1:1.
+ *   - No ASAP pair firing: scheduler guarantees target is always
+ *     at least N HR in the future before writing CCP3PRL.
+ *
+ * Flag-gated so V4 stays the fallback. V5_SCHEDULER=0 → V4 path
+ * (current working 109k baseline). V5_SCHEDULER=1 → V5.3 path. */
+#ifndef FEATURE_V5_SCHEDULER
+#define FEATURE_V5_SCHEDULER  0   /* WIP — motor runs chaotically, needs deeper
+                                   * rework. V4 scheduler (flag=0) is the proven
+                                   * 109k baseline. V5.3 implementation lives in
+                                   * sector_pi.c:CommutateV5_3 + garuda_service.c
+                                   * :V5_AcceptCapture — all gated by this flag. */
+#endif
+
+#if FEATURE_V5_SCHEDULER && !FEATURE_V4_SECTOR_PI
+#error "FEATURE_V5_SCHEDULER builds on top of V4 scaffolding — keep V4 flag on"
+#endif
+
+/* Default PTGT0LIM values. At FCY=100 MHz with PTGDIV=0, 1 tick = 10 ns.
+ * LOOPTIME_TCY is in PWM counter ticks (5 ns each on this CK device —
+ * FOSC_PWM 400 MHz with internal /2 divider on the PWM counter).
+ *
+ *   Valley sample: PWM trigger itself fires at counter=0. A tiny delay
+ *     covers ATA6847 comparator propagation (~500 ns) and signal settle.
+ *   Peak sample:  Counter triangle 0 → MPER → 0 each PWM period.
+ *     Valley to peak = MPER/2 PWM-cycle time.
+ *     At 40 kHz, MPER=4999 → ~25 µs cycle → ~12.5 µs valley→peak.
+ *     12.5 µs = 1250 PTG ticks. MPER * 5 ns / 2 / 10 ns = MPER/4.
+ */
+#define V5_PTG_TICK_NS          10u
+#define V5_PTG_VALLEY_DELAY     60u        /* 600 ns settle after trigger */
+#define V5_PTG_PEAK_DELAY       ((uint16_t)(LOOPTIME_TCY / 4u))
+
+#endif /* FEATURE_V4_SECTOR_PI */
+
+#if !FEATURE_V4_SECTOR_PI
 /* ── SCCP1 Fast ZC Polling Timer (FEATURE_IC_ZC=1) ────────────────── */
 /* Replaces edge-triggered IC with periodic timer that polls ATA6847
  * BEMF comparator directly. Step 0 experiment confirmed comparator
@@ -459,6 +1025,32 @@
 #define ZC_DEGLITCH_MAX         8U          /* At Tp >= ZC_DEGLITCH_SLOW_TP */
 #define ZC_DEGLITCH_FAST_TP     5U          /* Tp threshold for min filter (was 10) */
 #define ZC_DEGLITCH_SLOW_TP     50U         /* Tp threshold for max filter */
+
+/* PWM-aware IC age budget (replaces hard StpHR < 300 gate).
+ * Maximum acceptable IC-to-poll delay: IC fires on comparator edge,
+ * CLC D-FF updates on next PWM valley, poll reads CLC on next poll.
+ * Budget = pwmPeriod + pollPeriod + margin.
+ * In HR ticks (640ns): LOOPTIME_MICROSEC * 25/16 + pollPeriod_us * 25/16 + margin.
+ * At 40kHz: 39 + 7 + 10 = 56 HR ticks (~36µs)
+ * At 24kHz: 65 + 7 + 10 = 82 HR ticks (~53µs) */
+#define IC_AGE_PWM_HR       ((uint16_t)((uint32_t)LOOPTIME_MICROSEC * 25u / 16u))
+#define IC_AGE_POLL_HR      ((uint16_t)((1000000UL / ZC_POLL_FREQ_HZ) * 25u / 16u))
+#define IC_AGE_MARGIN_HR    10u   /* ~6.4µs margin for ISR jitter */
+#define IC_AGE_MAX_HR       (IC_AGE_PWM_HR + IC_AGE_POLL_HR + IC_AGE_MARGIN_HR)
+/* PWM period in HR ticks — used for candidateAge fallback check */
+#define PWM_PERIOD_HR       IC_AGE_PWM_HR
+/* Phase 2: IC lead budget — max acceptable IC-ahead-of-raw gap.
+ * If IC fires this far before raw stabilises, the IC caught a bounce.
+ * Derived from poll period + margin, not a magic number.
+ * At 210kHz: pollPeriodHR ≈ 7, margin 10 → 17 HR ticks (~11µs) */
+#define IC_LEAD_MAX_HR      (IC_AGE_POLL_HR + IC_AGE_MARGIN_HR)
+/* Phase 2: raw stability threshold for fast accept.
+ * Main rule: rawCoro >= 2 (two consecutive raw matches).
+ * Jitter insurance: raw has been stable for >= 1 poll period.
+ * rawCoro >= 2 is the primary gate; age check is backup for cases
+ * where rawCoro is exactly 1 but raw has been stable long enough
+ * that the single-sample concern doesn't apply. */
+#define RAW_STABLE_AGE_HR   IC_AGE_POLL_HR
 #endif
 
 /* ── Desync Recovery ───────────────────────────────────────────────── */
@@ -467,6 +1059,8 @@
 #define RECOVERY_TIME_MS    50U    /* Shortened from 200ms — PWM is OFF during
                                     * recovery so no current risk. Faster restart. */
 #define RECOVERY_COUNTS     ((uint16_t)((uint32_t)RECOVERY_TIME_MS * TIMER1_FREQ_HZ / 1000))
+
+#endif /* !FEATURE_V4_SECTOR_PI — end of V3-only config */
 
 /* ── ARM ───────────────────────────────────────────────────────────── */
 #define ARM_TIME_MS         200U

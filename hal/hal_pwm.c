@@ -19,6 +19,11 @@
 #include "port_config.h"
 #include "../garuda_config.h"
 
+/* SP mode flag from sector_pi.c — read here to switch active-phase drive
+ * from complementary to unipolar while SP is engaged. Complementary braking
+ * during the long OFF portion of an SP frame decelerates the motor. */
+extern volatile bool v4_spActive;
+
 /* Override data bits: [11:10] = OVRDAT, bit11=H, bit10=L
  *                     [13]    = OVRENH, [12] = OVRENL
  *
@@ -46,9 +51,22 @@ static inline void ApplyPhaseState(volatile uint16_t *ioconl,
             val |= 0x1000u;             /* Set OVRENL — override L */
             val &= ~0x0400u;            /* OVRDAT_L = 0 — L forced OFF */
 #else
-            /* Complementary: H and L alternate with dead time.
-             * Active braking during OFF → needs higher MAX_DUTY (~100%). */
-            val &= ~(0x3000u);          /* Clear OVRENH and OVRENL */
+            if (v4_spActive)
+            {
+                /* SP mode needs unipolar drive: MPER=0xFFFF means PWM is
+                 * LOW for ~60% of each sector. Under complementary drive
+                 * that lights the LS FET → motor brakes continuously →
+                 * catastrophic deceleration the instant SP engages. */
+                val &= ~0x2000u;        /* Clear OVRENH — PWM drives H */
+                val |= 0x1000u;         /* Set OVRENL — override L */
+                val &= ~0x0400u;        /* OVRDAT_L = 0 — L forced OFF */
+            }
+            else
+            {
+                /* Complementary: H and L alternate with dead time.
+                 * Active braking during OFF → needs higher MAX_DUTY. */
+                val &= ~(0x3000u);      /* Clear OVRENH and OVRENL */
+            }
 #endif
             break;
         case PHASE_LOW:
@@ -98,7 +116,7 @@ void HAL_PWM_Init(void)
     PG1IOCONL = 0x3000;     /* Start with overrides ON, OVRDAT=00 (float: H off, L off) */
     PG1IOCONH = 0x000E;     /* PENL=1, PENH=1, PMOD=complementary, POLH=active-low */
     PG1EVTL = 0x0118;       /* UPDTRG=TrigA, PGTRGSEL=EOC, ADTR1EN1=enabled */
-    PG1EVTH = 0x0040;       /* ADTR2EN2=enabled (Trigger2 for Vbus/pot) */
+    PG1EVTH = 0x0040;       /* ADTR2EN1=enabled (Trigger2 from TRIGA for Vbus/pot) */
     PG1FPCIL = PG1FPCIH = 0x00;
     PG1CLPCIL = PG1CLPCIH = 0x00;
     PG1FFPCIL = PG1FFPCIH = 0x00;
@@ -185,7 +203,34 @@ void HAL_PWM_SetDutyCycle(uint32_t duty)
     PG3DC = (uint16_t)duty;
     PG1DC = (uint16_t)duty;
 
+#if FEATURE_PTG_ZC
+    /* Track switching edge for PTG edge-relative sampling.
+     * PG1TRIGB fires ADC Trigger 2 at counter=duty (ON→OFF edge).
+     * PTG waits for this trigger, delays, then samples BEMF. */
+    PG1TRIGB = (uint16_t)duty;
+#endif
+
     /* Request buffer-to-active transfer at next SOC */
+    PG1STATbits.UPDREQ = 1;
+    PG2STATbits.UPDREQ = 1;
+    PG3STATbits.UPDREQ = 1;
+}
+
+/* Period-aware variant. Clamps duty to [MIN_DUTY, per - 200], NOT against
+ * MPER. In SP mode MPER = 0xFFFF but the intended pulse basis is the
+ * sector-matched `per` (timerPeriod << 7). Using MPER would let the ON
+ * pulse run wider than the sector. Non-SP callers pass per=LOOPTIME_TCY,
+ * so behavior matches HAL_PWM_SetDutyCycle (per-200 ≈ MAX_DUTY). */
+void HAL_PWM_SetDutyCyclePeriod(uint32_t duty, uint16_t per)
+{
+    uint32_t maxD = (per > 200U) ? (uint32_t)(per - 200U) : (uint32_t)per;
+    if (duty > maxD) duty = maxD;
+    if (duty < MIN_DUTY) duty = MIN_DUTY;
+
+    PG2DC = (uint16_t)duty;
+    PG3DC = (uint16_t)duty;
+    PG1DC = (uint16_t)duty;
+
     PG1STATbits.UPDREQ = 1;
     PG2STATbits.UPDREQ = 1;
     PG3STATbits.UPDREQ = 1;
@@ -232,4 +277,62 @@ void HAL_PWM_ForceAllLow(void)
     PG1IOCONL = (PG1IOCONL | 0x3000u | 0x0400u) & ~0x0800u;
     PG2IOCONL = (PG2IOCONL | 0x3000u | 0x0400u) & ~0x0800u;
     PG3IOCONL = (PG3IOCONL | 0x3000u | 0x0400u) & ~0x0800u;
+}
+
+/* ── Single-Pulse Mode (AVR-style) ─────────────────────────────── */
+/* Above 90k eRPM, change MPER from fixed 40kHz to match sector
+ * duration. One ON + one OFF per sector instead of many PWM pulses.
+ * No switching edges mid-sector → clean BEMF comparator output. */
+
+static bool spMode = false;
+
+void HAL_PWM_SetSinglePulse(uint16_t sectorPeriodTCY, uint32_t duty)
+{
+    /* sectorPeriodTCY is in HR ticks (640ns). Convert to PWM ticks.
+     * PWM clock = Fosc/2 = 200MHz, 1 tick = 5ns.
+     * HR tick = 640ns = 128 PWM ticks.
+     * sectorPWM = sectorPeriodHR × 128. */
+    uint32_t sectorPWM = (uint32_t)sectorPeriodTCY * 128UL;
+    if (sectorPWM > 0xFFFF) sectorPWM = 0xFFFF;
+    if (sectorPWM < 200) sectorPWM = 200;  /* minimum for dead-time */
+
+    /* Set master period to sector duration */
+    MPER = (uint16_t)sectorPWM;
+
+    /* Scale duty to new period */
+    if (duty > sectorPWM) duty = sectorPWM;
+
+    PG2DC = (uint16_t)duty;
+    PG3DC = (uint16_t)duty;
+    PG1DC = (uint16_t)duty;
+
+    PG1STATbits.UPDREQ = 1;
+    PG2STATbits.UPDREQ = 1;
+    PG3STATbits.UPDREQ = 1;
+
+    spMode = true;
+}
+
+void HAL_PWM_ExitSinglePulse(void)
+{
+    if (spMode)
+    {
+        MPER = LOOPTIME_TCY;
+        /* Restore ADC trigger to valley (counter=0 in center-aligned = midpoint) */
+        PG1TRIGA = 0x0000U;
+        PG1STATbits.UPDREQ = 1;
+        PG2STATbits.UPDREQ = 1;
+        PG3STATbits.UPDREQ = 1;
+        spMode = false;
+    }
+}
+
+bool HAL_PWM_IsSinglePulse(void)
+{
+    return spMode;
+}
+
+void HAL_PWM_SetSPFlag(bool on)
+{
+    spMode = on;
 }

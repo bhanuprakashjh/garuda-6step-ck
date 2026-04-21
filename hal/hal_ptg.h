@@ -1,0 +1,75 @@
+/**
+ * @file hal_ptg.h
+ * @brief V5.0 Peripheral Trigger Generator for per-sector BEMF sampling.
+ *
+ * The PTG is a core-independent state machine. We use it to fire an
+ * interrupt at a hardware-exact delay from each PWM trigger so the BEMF
+ * comparator GPIO can be sampled at an offset that software polling
+ * (SCCP1, ADC ISR) cannot reach. Zero CPU jitter.
+ *
+ * Gate: FEATURE_V5_PTG_ZC. When 0, every function is a no-op and the
+ * PTG module stays off. When 1, HAL_PTG_Start runs the queue and
+ * _PTG0Interrupt fires at (valley + PTGT0LIM ticks) every PWM cycle.
+ *
+ * A prior V3-era attempt lived in this same file with wrong opcodes
+ * (confirmed against DS70005349 Table 24-1). It has been removed;
+ * the V3 PTG path was never proven on bench.
+ */
+
+#ifndef HAL_PTG_H
+#define HAL_PTG_H
+
+#include "../garuda_config.h"
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/** Raw fire counter — incremented unconditionally in _PTG0Interrupt.
+ *  First sanity check that PTG is running at all. Defined as a
+ *  regular variable even when FEATURE_V5_PTG_ZC=0 (stays at 0) so
+ *  the telemetry populator doesn't need to be flag-gated. */
+extern volatile uint32_t v5_ptgFires;
+
+/** Per-polarity ZC shadow counters — incremented in _PTG0Interrupt
+ *  while the motor is in CL. Accept = comp state matches what the
+ *  post-ZC state should be for the current sector polarity (0 for
+ *  rising, 1 for falling on the inverted ATA6847 comparator).
+ *  Reject = comp state still pre-ZC. These are shadow-only — the
+ *  motor PI does not consume these samples yet. */
+extern volatile uint32_t v5_ptgRisingAcc;
+extern volatile uint32_t v5_ptgRisingRej;
+extern volatile uint32_t v5_ptgFallingAcc;
+extern volatile uint32_t v5_ptgFallingRej;
+
+#if FEATURE_V5_PTG_ZC
+
+/** Initialise PTG to a stopped, known-safe state. Idempotent. */
+void     HAL_PTG_Init(void);
+
+/** Load the step queue and start the PTG state machine. */
+void     HAL_PTG_Start(void);
+
+/** Stop the PTG state machine. Register values are preserved. */
+void     HAL_PTG_Stop(void);
+
+/** Update the trigger-to-sample delay (PTG ticks, ~10 ns each at default).
+ *  Safe while running — the new value is read on the next step iteration. */
+void     HAL_PTG_SetDelay(uint16_t ptgTicks);
+
+#else  /* !FEATURE_V5_PTG_ZC — fold calls away at compile time */
+
+static inline void HAL_PTG_Init(void)                { }
+static inline void HAL_PTG_Start(void)               { }
+static inline void HAL_PTG_Stop(void)                { }
+static inline void HAL_PTG_SetDelay(uint16_t t)      { (void)t; }
+
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* HAL_PTG_H */

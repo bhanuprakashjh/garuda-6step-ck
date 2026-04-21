@@ -24,20 +24,48 @@
 #include "../hal/hal_ic.h"
 #include "../hal/hal_com_timer.h"
 #endif
+#if FEATURE_IC_DMA_SHADOW
+#include "../hal/hal_ic_dma.h"
+#include "../hal/hal_dma_burst.h"
+#endif
 #if FEATURE_CLC_BLANKING
 #include "../hal/hal_clc.h"
 #endif
+
+#if !FEATURE_V4_SECTOR_PI
+
+/* Speed-adaptive front-end selector. Set by FastPoll at the start
+ * of each call based on stepPeriodHR vs ZC_IC_DIRECT_THRESHOLD_HR.
+ * When true, ReadBEMFComparator returns raw GPIO (0.64 µs resolution)
+ * instead of CLC D-FF (25 µs PWM-cycle quantization). */
+static bool useRawFrontEnd;
 
 /**
  * @brief Read the digital BEMF comparator output for a given phase.
  * @param phase 0=A, 1=B, 2=C
  * @return 1 if comparator output is high, 0 if low
+ *
+ * At low speed: CLC D-FF (noise-filtered, 1 sample per PWM cycle).
+ * At high speed: raw GPIO (9x faster, 4.75µs resolution).
+ * Threshold: ZC_IC_DIRECT_THRESHOLD_HR (~62k eRPM).
  */
 static inline uint8_t ReadBEMFComparator(uint8_t phase)
 {
 #if FEATURE_CLC_BLANKING
-    /* CLC D-FF output: sampled at mid-PWM, held between cycles.
-     * Eliminates switching noise aliasing (step-2 vector fix). */
+    if (useRawFrontEnd)
+    {
+        /* High speed: raw GPIO — CLC D-FF quantization (25µs) exceeds
+         * the reactive delay budget above ~80k eRPM. BEMF is strong
+         * at high speed so raw noise is manageable with corroboration. */
+        switch (phase)
+        {
+            case 0: return BEMF_A_GetValue() ? 1 : 0;
+            case 1: return BEMF_B_GetValue() ? 1 : 0;
+            case 2: return BEMF_C_GetValue() ? 1 : 0;
+            default: return 0;
+        }
+    }
+    /* Low speed: CLC D-FF (noise-filtered, PWM-synchronous). */
     return HAL_CLC_ReadOutput(phase);
 #else
     switch (phase)
@@ -48,6 +76,21 @@ static inline uint8_t ReadBEMFComparator(uint8_t phase)
         default: return 0;
     }
 #endif
+}
+
+/**
+ * @brief Read the RAW BEMF comparator GPIO (bypasses CLC D-FF).
+ * Used for raw corroboration: sanity-check that CLC D-FF isn't stale.
+ */
+static inline uint8_t ReadRawBEMFComparator(uint8_t phase)
+{
+    switch (phase)
+    {
+        case 0: return BEMF_A_GetValue() ? 1 : 0;
+        case 1: return BEMF_B_GetValue() ? 1 : 0;
+        case 2: return BEMF_C_GetValue() ? 1 : 0;
+        default: return 0;
+    }
 }
 
 /* ── ZC V2 Mode Helpers (Phase 2) ─────────────────────────────────── */
@@ -101,10 +144,27 @@ void BEMF_ZC_Init(volatile GARUDA_DATA_T *pData)
     pData->icZc.lastCommHR = 0;
     pData->icZc.zcCandidateHR = 0;
     pData->icZc.zcCandidateT1 = 0;
+    pData->icZc.diagDmaPrimaryAccept = 0;
+    pData->icZc.diagDmaPrimaryMiss = 0;
     pData->icZc.diagAccepted = 0;
     pData->icZc.diagLcoutAccepted = 0;
     pData->icZc.diagFalseZc = 0;
     pData->icZc.diagPollCycles = 0;
+    pData->icZc.rawCoro = 0;
+    pData->icZc.hasFirstClcMatch = false;
+    pData->icZc.firstClcMatchHR = 0;
+    pData->icZc.hasRawFirstMatch = false;
+    pData->icZc.rawFirstMatchHR = 0;
+    pData->icZc.rawFirstMatchT1 = 0;
+    pData->icZc.diagRawVeto = 0;
+    pData->icZc.diagIcAgeReject = 0;
+    pData->icZc.diagTrackFallback = 0;
+    pData->icZc.diagRawStableBlock = 0;
+    pData->icZc.diagTsFromIc = 0;
+    pData->icZc.diagTsFromRaw = 0;
+    pData->icZc.diagTsFromClc = 0;
+    pData->icZc.diagTsFromPoll = 0;
+    pData->icZc.diagIcLeadReject = 0;
     pData->icZc.lastCmpState = 0xFF;
     {
         uint8_t i;
@@ -117,6 +177,7 @@ void BEMF_ZC_Init(volatile GARUDA_DATA_T *pData)
 #if FEATURE_IC_ZC_CAPTURE
     pData->icZc.icCommStamp = 0;
     pData->icZc.icArmed = false;
+    pData->icZc.icCandidateValid = false;
     pData->icZc.diagIcAccepted = 0;
     pData->icZc.diagIcBounce = 0;
     HAL_ZcIC_Disarm();
@@ -135,6 +196,8 @@ void BEMF_ZC_Init(volatile GARUDA_DATA_T *pData)
     pData->zcDiag.diagFallingTimeouts = 0;
     pData->zcDiag.diagRisingRejects = 0;
     pData->zcDiag.diagFallingRejects = 0;
+    pData->zcDiag.diagTargetPast = 0;
+    pData->zcDiag.lastScheduleMarginHR = 0;
     {
         uint8_t i;
         for (i = 0; i < 6; i++) {
@@ -182,6 +245,92 @@ void BEMF_ZC_Init(volatile GARUDA_DATA_T *pData)
     pData->timing.prevZcIntervalHR = 0;
     pData->timing.stepPeriodHR = 0;
     pData->timing.hasPrevZcHR = false;
+
+    /* PLL predictor init (Step 1: shadow/telemetry mode) */
+    pData->zcPred.predStepHR = 0;
+    pData->zcPred.predNextCommHR = 0;
+    pData->zcPred.predZcHR = 0;
+    pData->zcPred.predZcOffsetHR = 0;
+    pData->zcPred.phaseErrHR = 0;
+    pData->zcPred.locked = false;
+    pData->zcPred.missCount = 0;
+    pData->zcPred.lastCommHR = 0;
+    pData->zcPred.scanOpenHR = 0;
+    pData->zcPred.scanCloseHR = 0;
+    pData->zcPred.diagPredCommCount = 0;
+    pData->zcPred.diagPhaseErrAccum = 0;
+    pData->zcPred.diagZcInWindow = 0;
+    pData->zcPred.diagZcOutWindow = 0;
+    pData->zcPred.diagMinMarginHR = 32767;
+    pData->zcPred.gateActive = false;
+    pData->zcPred.gateArmCount = 0;
+    pData->zcPred.gateRevRejects = 0;
+    pData->zcPred.diagWinCandInGated = 0;
+    pData->zcPred.diagWinCandOutGated = 0;
+    pData->zcPred.diagWinOutEarly = 0;
+    pData->zcPred.diagWinOutLate = 0;
+    pData->zcPred.diagWindowReject = 0;
+    pData->zcPred.diagWindowRecovered = 0;
+    pData->zcPred.predictiveMode = false;
+    pData->zcPred.handoffPending = false;
+    pData->zcPred.lastPredCommHR = 0;
+    pData->zcPred.pendingPredCommHR = 0;
+    pData->zcPred.pendingPredValid = false;
+    pData->zcPred.lastReactiveTargetHR = 0;
+    pData->zcPred.lastReactiveTAL = TIMING_ADVANCE_LEVEL;
+    pData->zcPred.predVsReactiveDelta = 0;
+    pData->zcPred.deltaOkCount = 0;
+    pData->zcPred.entryScore = 0;
+    pData->zcPred.diagPredCommOwned = 0;
+    pData->zcPred.diagPredEnter = 0;
+    pData->zcPred.diagPredEntryLate = 0;
+    pData->zcPred.diagPredIsrFired = 0;
+    pData->zcPred.diagPredIsrEntries = 0;
+    pData->zcPred.diagPredExitRed = 0;
+    pData->zcPred.diagPredExitMiss = 0;
+    pData->zcPred.diagPredExitYellow = 0;
+    pData->zcPred.diagPredExitPhaseErr = 0;
+    pData->zcPred.diagPredExitTimeout = 0;
+#if FEATURE_6STEP_DPLL
+    pData->zcPred.phaseBiasHR    = 0;
+    pData->zcPred.advanceCmdHR   = 0;    /* V1: zero, phaseBias absorbs all */
+    pData->zcPred.advanceTrimHR  = 0;
+    pData->zcPred.lastMeasTsHR   = 0;
+    pData->zcPred.measDeadlineHR = 0;
+    pData->zcPred.fallbackReason = 0;
+    pData->zcPred.graceCount     = 0;
+    pData->zcPred.dpllErrHR      = 0;
+    pData->zcPred.dmaMeasUsedCount = 0;
+    pData->zcPred.dmaMeasRejectCount = 0;
+    pData->zcPred.predCloseAgreeCount = 0;
+    pData->zcPred.predCloseDisagreeCount = 0;
+#endif
+#endif
+
+#if FEATURE_SECTOR_PI
+    pData->zcSync.T_hatHR           = 0;
+    pData->zcSync.syncIntHR         = 0;
+    pData->zcSync.lastCommHR        = 0;
+    pData->zcSync.lastMeasHR        = 0;
+    pData->zcSync.prevStepRisingZc  = false;
+    pData->zcSync.capValueHR        = 0;
+    pData->zcSync.setValueHR        = 0;
+    pData->zcSync.syncErrHR         = 0;
+    pData->zcSync.detDelayHR        = ZC_SYNC_DET_DELAY_HR;
+    pData->zcSync.advanceCmdHR      = 0;
+    pData->zcSync.clusterMidHR      = 0;
+    pData->zcSync.clusterCount      = 0;
+    pData->zcSync.clusterWidthHR    = 0;
+    pData->zcSync.clusterRejectReason = 0;
+    pData->zcSync.mode              = 0;  /* OFF */
+    pData->zcSync.goodStreak        = 0;
+    pData->zcSync.missStreak        = 0;
+    pData->zcSync.fallbackReason    = 0;
+    pData->zcSync.syncVsReactiveDelta = 0;
+    pData->zcSync.diagSyncAccepts   = 0;
+    pData->zcSync.diagSyncMisses    = 0;
+    pData->zcSync.diagSyncEntries   = 0;
+    pData->zcSync.diagSyncExits     = 0;
 #endif
 }
 
@@ -200,6 +349,92 @@ static inline uint8_t ComputeFilterLevel(uint16_t stepPeriod)
         (uint8_t)((uint16_t)(stepPeriod - ZC_DEGLITCH_FAST_TP) *
                   (ZC_DEGLITCH_MAX - ZC_DEGLITCH_MIN) /
                   (ZC_DEGLITCH_SLOW_TP - ZC_DEGLITCH_FAST_TP));
+}
+
+/**
+ * @brief Speed-adaptive timing advance level.
+ *
+ * The static TIMING_ADVANCE_LEVEL works fine at low/mid speed but at
+ * high eRPM the delayHR budget = (spHR/2 - spHR*TAL/8) shrinks below
+ * the detection-pipeline latency (~16 µs FastPoll + rawStable + accept
+ * overhead), so the schedule margin goes negative and the wall hits.
+ *
+ * Measured at 100k eRPM with TAL=3:  delayHR = 13 µs, latency ≈ 16 µs,
+ *                                    margin ≈ −3 µs (matches CSV).
+ * With TAL=2 at the same speed:      delayHR = 25 µs, margin ≈ +9 µs.
+ *
+ * This function remains the legacy "effective" advance map: the TAL
+ * that made the poll-timed reactive path run acceptably on the bench.
+ * On the HR path below, that effective TAL is split into:
+ *   1. pure torque advance
+ *   2. explicit detector-latency compensation
+ *
+ * The split keeps poll-timed scheduling near the old behavior while
+ * giving DMA-timed paths a place to remove only the detector delay.
+ */
+static inline uint8_t AdaptiveTimingAdvance(uint32_t eRPM)
+{
+    static uint8_t level = TIMING_ADVANCE_LEVEL;
+
+    /* High band: drop to TAL-2 above 115k, recover below 105k */
+    if (TIMING_ADVANCE_LEVEL >= 3)
+    {
+        if (level >= (TIMING_ADVANCE_LEVEL - 1) && eRPM > 115000U)
+            level = (TIMING_ADVANCE_LEVEL > 2U) ? (TIMING_ADVANCE_LEVEL - 2U) : 1U;
+        else if (level <  (TIMING_ADVANCE_LEVEL - 1) && eRPM < 105000U)
+            level = TIMING_ADVANCE_LEVEL - 1U;
+    }
+
+    /* Mid band: drop to TAL-1 above 75k, recover below 65k */
+    if (level >= TIMING_ADVANCE_LEVEL && eRPM > 75000U)
+        level = (TIMING_ADVANCE_LEVEL > 1U) ? (TIMING_ADVANCE_LEVEL - 1U) : 1U;
+    else if (level <  TIMING_ADVANCE_LEVEL && level >= (TIMING_ADVANCE_LEVEL - 1)
+             && eRPM < 65000U)
+        level = TIMING_ADVANCE_LEVEL;
+
+    return level;
+}
+
+static inline uint8_t ReactiveTorqueAdvanceLevel(uint8_t effectiveTal,
+                                                 uint16_t stepHR)
+{
+#if FEATURE_REACTIVE_LATENCY_SPLIT && FEATURE_IC_DMA_SHADOW
+    if (stepHR > 0u && stepHR < DMA_ZC_DIRECT_THRESHOLD_HR)
+    {
+        if (effectiveTal > REACTIVE_LATENCY_COMP_LEVELS)
+            return (uint8_t)(effectiveTal - REACTIVE_LATENCY_COMP_LEVELS);
+        return 0u;
+    }
+#else
+    (void)stepHR;
+#endif
+
+    return effectiveTal;
+}
+
+static inline uint16_t ReactiveDetectorLatencyCompHR(
+    volatile GARUDA_DATA_T *pData, uint16_t stepHR)
+{
+#if FEATURE_REACTIVE_LATENCY_SPLIT && FEATURE_IC_DMA_SHADOW
+    if (stepHR > 0u &&
+        stepHR < DMA_ZC_DIRECT_THRESHOLD_HR &&
+        pData->dmaShadow.smoothedLatencyHR > 0u)
+    {
+        uint16_t maxCompHR = (uint16_t)((stepHR >> 3) *
+                                        REACTIVE_LATENCY_COMP_LEVELS);
+        uint16_t latHR = pData->dmaShadow.smoothedLatencyHR;
+
+        if (maxCompHR > 0u && latHR > maxCompHR)
+            latHR = maxCompHR;
+
+        return latHR;
+    }
+#else
+    (void)pData;
+    (void)stepHR;
+#endif
+
+    return 0u;
 }
 #endif
 
@@ -223,6 +458,11 @@ void BEMF_ZC_OnCommutation(volatile GARUDA_DATA_T *pData)
     if (pData->timing.revStepCount >= 6)
     {
         pData->timing.revStepCount = 0;
+        /* Reset per-revolution gate reject counter.
+         * If 2+ rejects in one revolution, disable gate. */
+        if (pData->zcPred.gateRevRejects >= 2)
+            pData->zcPred.gateActive = false;
+        pData->zcPred.gateRevRejects = 0;
         bool desyncDetected = false;
 
 #if FEATURE_IC_ZC
@@ -288,11 +528,28 @@ void BEMF_ZC_OnCommutation(volatile GARUDA_DATA_T *pData)
 
     pData->timing.lastCommTick = pData->timer1Tick;
     pData->timing.stepsSinceLastZc++;
+    /* Don't clear deadlineActive in predictive mode — the predictor
+     * already programmed the next compare and is relying on this flag
+     * to gate the next _CCP4Interrupt. */
+#if FEATURE_SECTOR_PI
+    /* When sector PI can own scheduling, NEVER cancel the timer here.
+     * The PI block in _CCT3Interrupt manages the timer directly.
+     * In shadow mode (mode!=2), reactive scheduling handles the timer
+     * via ScheduleCommutation, and the one-shot ISR pattern means
+     * there's no stale target to cancel. */
+    if (!pData->zcPred.predictiveMode && pData->zcSync.mode != 2)
+    {
+        pData->timing.deadlineActive = false;
+        HAL_ComTimer_Cancel();
+    }
+#elif FEATURE_IC_ZC
+    if (!pData->zcPred.predictiveMode)
+    {
+        pData->timing.deadlineActive = false;
+        HAL_ComTimer_Cancel();
+    }
+#else
     pData->timing.deadlineActive = false;
-
-#if FEATURE_IC_ZC
-    /* Cancel any pending hardware commutation timer (forced step preempts) */
-    HAL_ComTimer_Cancel();
 #endif
 
     /* Set forced commutation timeout: ZC_TIMEOUT_MULT * period.
@@ -328,6 +585,19 @@ void BEMF_ZC_OnCommutation(volatile GARUDA_DATA_T *pData)
     {
         /* Record commutation time in SCCP4 ticks for interval rejection */
         pData->icZc.lastCommHR = HAL_ComTimer_ReadTimer();
+
+#if FEATURE_6STEP_DPLL
+        /* Set measurement deadline: ZC should arrive within 1.5× step.
+         * Independent of deadlineActive (which the predictor keeps
+         * armed for commutation scheduling). */
+        if (pData->zcPred.predictiveMode && pData->zcPred.predStepHR > 0)
+        {
+            pData->zcPred.measDeadlineHR = (uint16_t)(
+                pData->icZc.lastCommHR
+                + pData->zcPred.predStepHR
+                + (pData->zcPred.predStepHR >> 1));
+        }
+#endif
 
         /* PRODUCTION BLANKING: fixed minimum + 50% interval rejection.
          *
@@ -408,6 +678,9 @@ void BEMF_ZC_OnCommutation(volatile GARUDA_DATA_T *pData)
         pData->icZc.blankingEndHR = pData->icZc.lastCommHR + blankHR;
         pData->icZc.activeChannel = step->floatingPhase;
         pData->icZc.pollFilter = 0;
+        pData->icZc.rawCoro = 0;
+        pData->icZc.hasFirstClcMatch = false;
+        pData->icZc.hasRawFirstMatch = false;
         pData->icZc.lastCmpState = 0xFF;  /* force re-read on first poll */
 
 #if FEATURE_IC_ZC_CAPTURE
@@ -419,6 +692,29 @@ void BEMF_ZC_OnCommutation(volatile GARUDA_DATA_T *pData)
                                step->zcPolarity > 0);
             pData->icZc.icCommStamp = HAL_ZcIC_ReadTimer();
             pData->icZc.icArmed = false;
+            pData->icZc.icCandidateValid = false;
+        }
+#endif
+
+#if FEATURE_DMA_BURST_CAPTURE
+        /* Research capture: MUST run BEFORE HAL_ZcDma_OnCommutation
+         * below so that the prior step's edges can still be dumped
+         * using the old commHead marker. Closes the previously-open
+         * slot (spanning the full step including post-poll tail) and
+         * opens a new slot for this step. */
+        HAL_DmaBurst_OnCommutation(pData->icZc.lastCommHR,
+                                   pData->currentStep,
+                                   step->zcPolarity > 0);
+#endif
+
+#if FEATURE_IC_DMA_SHADOW
+        /* DMA shadow: route floating-phase RP to both CCP2 and CCP5,
+         * update commHead markers for bounded scan at probe time.
+         * This does NOT affect live detection. */
+        {
+            static const uint16_t rpPins[3] = { BEMF_A_RP, BEMF_B_RP, BEMF_C_RP };
+            HAL_ZcDma_OnCommutation(rpPins[step->floatingPhase],
+                                    step->zcPolarity > 0);
         }
 #endif
 
@@ -446,6 +742,188 @@ void BEMF_ZC_OnCommutation(volatile GARUDA_DATA_T *pData)
             pData->icZc.filterLevel = ComputeFilterLevel(flTp);
         }
         pData->icZc.phase = IC_ZC_BLANKING;
+
+        /* ── PLL Predictor: shadow computation (Step 1) ──────────────
+         * Compute predicted next commutation and ZC times without
+         * changing actual scheduling. Runs in parallel with reactive
+         * path to verify tracking quality before enabling. */
+        if (pData->state == ESC_CLOSED_LOOP &&
+            pData->zcCtrl.refIntervalHR > 0 &&
+            pData->timing.hasPrevZcHR)
+        {
+            /* Use exact OC fire time captured in _CCP4Interrupt,
+             * not HAL_ComTimer_ReadTimer() which includes ISR latency.
+             * lastCommHR is set to CCP4RA in the commutation ISR. */
+            uint16_t commHR = pData->zcPred.lastCommHR;
+            uint16_t spHR = pData->zcCtrl.refIntervalHR;
+
+            /* Seed predictor from refInterval on first valid step */
+            if (pData->zcPred.predStepHR == 0)
+                pData->zcPred.predStepHR = spHR;
+
+            /* Seed phase offset from measured delay on first valid step.
+             * After seeding, predZcOffsetHR is IIR-updated from accepted
+             * ZCs in RecordZcTiming. This replaces the fixed half+advance
+             * formula which doesn't match the actual reactive phase. */
+            if (pData->zcPred.predZcOffsetHR == 0 &&
+                pData->zcPred.lastRealZcDelayHR > 0)
+            {
+                pData->zcPred.predZcOffsetHR =
+                    pData->zcPred.lastRealZcDelayHR;
+            }
+
+            /* Predict next commutation: this comm + one step period */
+            pData->zcPred.predNextCommHR = commHR + pData->zcPred.predStepHR;
+
+            /* Predict where ZC should land in this sector.
+             * Uses adaptive phase offset instead of fixed half+advance.
+             * The offset converges to the actual comm-to-ZC relationship
+             * and will adapt as predictor scheduling changes the phase. */
+            pData->zcPred.predZcHR = commHR + pData->zcPred.predZcOffsetHR;
+
+            /* Scan window: +/- 25% of step period around predicted ZC. */
+            uint16_t windowHR = pData->zcPred.predStepHR >> 2;
+            pData->zcPred.scanOpenHR = pData->zcPred.predZcHR - windowHR;
+            pData->zcPred.scanCloseHR = pData->zcPred.predZcHR + windowHR;
+
+            /* Predictor scheduling margin: how far ahead is predNextComm
+             * from now? This is a real measurement, not a nominal calc. */
+            {
+                int16_t predMargin = (int16_t)(pData->zcPred.predNextCommHR
+                                               - HAL_ComTimer_ReadTimer());
+                if (predMargin < pData->zcPred.diagMinMarginHR)
+                    pData->zcPred.diagMinMarginHR = predMargin;
+            }
+
+            pData->zcPred.diagPredCommCount++;
+
+            /* Track miss count — incremented here, cleared when ZC
+             * correction arrives in RecordZcTiming.
+             *
+             * At high speed with reactive scheduling, ZC detection is
+             * inherently late (target-past), so missCount reaches 2-3
+             * normally between telemetry samples. Use tiered thresholds:
+             * >2: soft unlock (stop trusting phase for lock decisions)
+             * >4: hard exit (stop predictive scheduling + cancel handoff) */
+            pData->zcPred.missCount++;
+            if (pData->zcPred.missCount > 4)
+            {
+                pData->zcPred.locked = false;
+                /* Only clear entry-related state if predictive mode
+                 * is active. Otherwise let the entry path complete. */
+                if (pData->zcPred.predictiveMode)
+                {
+                    pData->zcPred.predictiveMode = false;
+                    pData->zcPred.pendingPredValid = false;
+                    pData->zcPred.deltaOkCount = 0;
+                    pData->zcPred.entryScore = 0;
+                    pData->zcPred.handoffPending = false;
+                    pData->zcPred.diagPredExitMiss++;
+                }
+            }
+            else if (pData->zcPred.missCount > 2)
+            {
+                pData->zcPred.locked = false;
+            }
+
+            /* Predictive mode entry is now in RecordZcTiming, evaluated
+             * after the current ZC's phaseErr/offset/locked are refreshed.
+             * This avoids using stale state from the previous step. */
+        }
+    }
+#endif
+
+#if FEATURE_SECTOR_PI && FEATURE_IC_DMA_SHADOW
+    /* ── Sector PI: update per-commutation state ──────────────────
+     * prevStepRisingZc records the polarity of the CURRENT active
+     * sector (after AdvanceStep). In shadow mode the DMA comm marker
+     * is also refreshed for the current sector, so this is consistent.
+     * NOTE: for Phase 5 ownership, the ISR must query the DMA ring
+     * BEFORE AdvanceStep/OnCommutation update the markers.
+     *
+     * Mode entry: when speed crosses ZC_SYNC_ENTRY_ERPM, activate
+     * shadow mode and seed T_hat from the reactive IIR. */
+    pData->zcSync.prevStepRisingZc =
+        (commutationTable[pData->currentStep].zcPolarity > 0);
+    /* Use lastReactiveTargetHR — the value passed to ScheduleAbsolute,
+     * which is the actual commutation time (SCCP4 compare match target).
+     * ReadTimer() at ISR entry includes interrupt latency (1-5 µs).
+     * icZc.lastCommHR includes ISR + processing latency (10-30 µs).
+     * The scheduled target is the true commutation moment. */
+    /* In owned mode, the ISR updates lastCommHR with thisCommHR.
+     * Don't overwrite it here with lastReactiveTargetHR (which
+     * stops updating when reactive scheduling is skipped). */
+    if (pData->zcSync.mode != 2)
+        pData->zcSync.lastCommHR = pData->zcPred.lastReactiveTargetHR;
+
+    if (pData->state == ESC_CLOSED_LOOP &&
+        pData->zcSync.mode == 0 &&
+        pData->zcCtrl.refIntervalHR > 0)
+    {
+        uint32_t eRPM = 0;
+        if (pData->zcCtrl.refIntervalHR > 0)
+            eRPM = 15625000UL / pData->zcCtrl.refIntervalHR;
+
+        if (eRPM >= ZC_SYNC_ENTRY_ERPM)
+        {
+            pData->zcSync.mode       = 1;  /* SHADOW */
+            pData->zcSync.T_hatHR    = pData->zcCtrl.refIntervalHR;
+            pData->zcSync.syncIntHR  = pData->zcCtrl.refIntervalHR;
+            pData->zcSync.detDelayHR = ZC_SYNC_DET_DELAY_HR;
+            pData->zcSync.goodStreak = 0;
+            pData->zcSync.missStreak = 0;
+            /* Seed torque advance for current speed */
+            pData->zcSync.advanceCmdHR = (uint16_t)(
+                (uint32_t)ZC_SYNC_ADVANCE_FP8
+                * pData->zcSync.T_hatHR >> 8);
+        }
+    }
+    /* Exit shadow if speed drops below hysteresis threshold */
+    else if (pData->zcSync.mode == 1 &&
+             pData->zcCtrl.refIntervalHR > 0)
+    {
+        uint32_t eRPM = 15625000UL / pData->zcCtrl.refIntervalHR;
+        if (eRPM < ZC_SYNC_EXIT_ERPM)
+            pData->zcSync.mode = 0;  /* OFF */
+
+        /* Shadow → Owned transition:
+         * goodStreak proves the PI model tracks consistently.
+         * Entry only when reactive is in TRACK mode (stable). */
+        if (pData->zcSync.goodStreak >= 12 &&
+            pData->zcCtrl.mode == ZC_MODE_TRACK &&
+            eRPM >= ZC_SYNC_ENTRY_ERPM)
+        {
+            pData->zcSync.mode = 2;  /* OWNED */
+            pData->zcSync.fallbackReason = 0;
+            pData->zcSync.missStreak = 0;
+            pData->zcSync.diagSyncEntries++;
+            /* Arm the FIRST owned commutation schedule.
+             * Mode flips inside OnCommutation, AFTER the ISR's
+             * mode==2 block already ran (and skipped because mode
+             * was still 1). Without this, no SCCP3 compare is armed,
+             * _CCT3IE stays 0, and the ISR never fires again.
+             * The ADC backup path takes over instead. */
+            {
+                uint16_t nowHR = HAL_ComTimer_ReadTimer();
+                uint16_t nextHR = nowHR + pData->zcSync.T_hatHR;
+                HAL_ComTimer_ScheduleAbsolute(nextHR);
+                pData->timing.deadlineActive = true;
+            }
+            /* Use current comm time as lastCommHR for the PI */
+            pData->zcSync.lastCommHR = pData->icZc.lastCommHR;
+        }
+    }
+    /* Exit owned if speed drops */
+    else if (pData->zcSync.mode == 2 &&
+             pData->zcCtrl.refIntervalHR > 0)
+    {
+        uint32_t eRPM = 15625000UL / pData->zcCtrl.refIntervalHR;
+        if (eRPM < ZC_SYNC_EXIT_ERPM)
+        {
+            pData->zcSync.mode = 1;  /* back to SHADOW */
+            pData->zcSync.fallbackReason = 3;
+            pData->zcSync.diagSyncExits++;
+        }
     }
 #endif
 }
@@ -586,7 +1064,37 @@ ZC_TIMEOUT_RESULT_T BEMF_ZC_CheckTimeout(volatile GARUDA_DATA_T *pData)
         return ZC_TIMEOUT_NONE;
 
     if (pData->timing.deadlineActive)
+    {
+#if FEATURE_6STEP_DPLL
+        /* In predictive mode, deadlineActive is always true (predictor
+         * keeps the timer armed). Use measDeadlineHR instead — it's
+         * the expected ZC arrival window, independent of the commutation
+         * timer. If the ZC hasn't arrived by 1.5× step period, it's
+         * a measurement timeout and the predictor should exit. */
+        if (pData->zcPred.predictiveMode &&
+            pData->zcPred.measDeadlineHR != 0)
+        {
+            int16_t sinceDl = (int16_t)(
+                HAL_ComTimer_ReadTimer() - pData->zcPred.measDeadlineHR);
+            if (sinceDl > 0)
+            {
+                /* Measurement timeout — ZC expected but not arrived */
+                pData->zcPred.missCount++;
+                pData->zcPred.measDeadlineHR = 0; /* prevent re-trigger */
+                if (pData->zcPred.missCount > 2)
+                {
+                    /* Exit predictive mode */
+                    pData->zcPred.predictiveMode = false;
+                    pData->zcPred.fallbackReason = 3; /* measTimeout */
+                    pData->zcPred.entryScore = 0;
+                    pData->timing.deadlineActive = false;
+                    /* Let the reactive timeout path run on next call */
+                }
+            }
+        }
+#endif
         return ZC_TIMEOUT_NONE;  /* Waiting for scheduled commutation */
+    }
 
     if (pData->timing.forcedCountdown > 0)
     {
@@ -598,6 +1106,18 @@ ZC_TIMEOUT_RESULT_T BEMF_ZC_CheckTimeout(volatile GARUDA_DATA_T *pData)
             pData->zcDiag.zcLatencyPct = 0xFFu;  /* 0xFF = timeout */
             pData->zcDiag.actualForcedComm++;
             pData->zcDiag.zcTimeoutCount++;
+            /* Disarm gate and exit predictive mode on timeout */
+            pData->zcPred.gateActive = false;
+            pData->zcPred.gateArmCount = 0;
+            pData->zcPred.deltaOkCount = 0;
+            pData->zcPred.entryScore = 0;
+            pData->zcPred.handoffPending = false;
+            if (pData->zcPred.predictiveMode)
+            {
+                pData->zcPred.predictiveMode = false;
+                pData->zcPred.pendingPredValid = false;
+                pData->zcPred.diagPredExitTimeout++;
+            }
             /* Per-polarity and per-step timeout tracking */
             if (commutationTable[pData->currentStep].zcPolarity > 0)
                 pData->zcDiag.diagRisingTimeouts++;
@@ -678,6 +1198,20 @@ void BEMF_ZC_ScheduleCommutation(volatile GARUDA_DATA_T *pData)
     if (pData->timing.deadlineActive)
         return;
 
+    /* Step 3: In predictive mode, commutation is already scheduled
+     * by _CCP4Interrupt. ZC detection only updates the predictor. */
+#if FEATURE_IC_ZC
+    if (pData->zcPred.predictiveMode)
+        return;
+#endif
+
+#if FEATURE_SECTOR_PI
+    /* Sector PI owns commutation — skip reactive scheduling.
+     * Poll detection and RecordZcTiming still run for supervision. */
+    if (pData->zcSync.mode == 2)
+        return;
+#endif
+
     /* Phase 4: schedule from protected refInterval, not min-of-recent.
      * The old min(IIR, 2-step-avg) shortcut amplified false short
      * intervals — one bad ZC immediately tightened the next schedule.
@@ -704,10 +1238,20 @@ void BEMF_ZC_ScheduleCommutation(volatile GARUDA_DATA_T *pData)
      * waitTime = interval / 2 - advance
      *
      * advance_level: 0=0°, 1=7.5°, 2=15°, 3=22.5°
-     * This automatically scales with speed — no eRPM-based ramp needed.
-     * Default level 2 = 15° advance at all speeds. */
+     *
+     * The HR path below further splits this into:
+     *   pure torque advance
+     *   explicit detector-latency compensation
+     *
+     * That split only applies once HR timing is valid and the DMA
+     * shadow estimator has learned a plausible poll latency. */
+#if FEATURE_IC_ZC
+    uint8_t tal = AdaptiveTimingAdvance(eRPM);
+#else
+    uint8_t tal = TIMING_ADVANCE_LEVEL;
+#endif
     uint16_t halfPeriod = sp >> 1;
-    uint16_t advance = (sp >> 3) * TIMING_ADVANCE_LEVEL;
+    uint16_t advance = (sp >> 3) * tal;
     uint16_t delay = (halfPeriod > advance) ? (halfPeriod - advance) : 1;
 
 #if FEATURE_IC_ZC
@@ -725,12 +1269,45 @@ void BEMF_ZC_ScheduleCommutation(volatile GARUDA_DATA_T *pData)
                           ? pData->zcCtrl.refIntervalHR
                           : pData->timing.stepPeriodHR;
 
-            /* AM32-style: half interval minus advance fraction */
+            /* AM32-style: half interval minus advance fraction.
+             * Uses the same speed-adaptive `tal` computed above so
+             * the HR scheduling path tracks the Timer1 path. */
             uint16_t halfHR = spHR >> 1;
-            uint16_t advHR = (spHR >> 3) * TIMING_ADVANCE_LEVEL;
+            uint16_t advHR = (spHR >> 3) * tal;
             uint16_t delayHR = (halfHR > advHR) ? (halfHR - advHR) : 2;
 
             uint16_t targetHR = pData->timing.lastZcTickHR + delayHR;
+
+            /* Capture reactive scheduling state for handoff continuity.
+             * The predictor must seed from this exact target and TAL
+             * to avoid a phase jump at entry. */
+            pData->zcPred.lastReactiveTargetHR = targetHR;
+            pData->zcPred.lastReactiveTAL = tal;
+
+            /* Shadow delta: what would the predictor schedule vs reactive?
+             * Predictor formula: lastZcHR + (predStepHR - predZcOffsetHR)
+             * This is the ZC-anchored next-comm from learned states. */
+            if (pData->zcPred.predStepHR > 0 &&
+                pData->zcPred.predZcOffsetHR > 0 &&
+                pData->zcPred.predStepHR > pData->zcPred.predZcOffsetHR)
+            {
+                uint16_t predTargetHR = pData->timing.lastZcTickHR +
+                    (pData->zcPred.predStepHR - pData->zcPred.predZcOffsetHR);
+                int16_t delta = (int16_t)(predTargetHR - targetHR);
+                pData->zcPred.predVsReactiveDelta = delta;
+
+                /* Track consecutive small deltas for entry validation */
+                int16_t absDelta = (delta >= 0) ? delta : -delta;
+                if (absDelta <= 10)  /* ~6.4µs */
+                {
+                    if (pData->zcPred.deltaOkCount < 255)
+                        pData->zcPred.deltaOkCount++;
+                }
+                else
+                {
+                    pData->zcPred.deltaOkCount = 0;
+                }
+            }
 
             /* Check if target is in the past.
              * At high speed (TpHR < 200), filter + compute latency can
@@ -738,8 +1315,12 @@ void BEMF_ZC_ScheduleCommutation(volatile GARUDA_DATA_T *pData)
              * commutate ASAP via hardware timer rather than falling through
              * to the imprecise Timer1 path (50µs jitter at Tp:2). */
             int16_t margin = (int16_t)(targetHR - HAL_ComTimer_ReadTimer());
+            pData->zcDiag.lastScheduleMarginHR = margin;
             if (margin <= 0)
+            {
                 targetHR = HAL_ComTimer_ReadTimer() + 2;  /* Fire ASAP */
+                pData->zcDiag.diagTargetPast++;
+            }
             HAL_ComTimer_ScheduleAbsolute(targetHR);
             pData->timing.commDeadline = pData->timing.lastZcTick + delay;
             pData->timing.deadlineActive = true;
@@ -778,6 +1359,61 @@ void BEMF_ZC_ScheduleCommutation(volatile GARUDA_DATA_T *pData)
 void RecordZcTiming(volatile GARUDA_DATA_T *pData,
                     uint16_t zcTick, uint16_t hrTick)
 {
+#if FEATURE_DMA_ZC_DIRECT
+    /* ── DMA poll-latency measurement (V3) ─────────────────────────────
+     * Measure how far the poll-accepted timestamp lags the hardware
+     * DMA edge. Store the result in dmaShadow.lastCorrectionHR for
+     * the commutation scheduler to use as an advance correction.
+     *
+     * IMPORTANT: hrTick is NOT modified. Intervals, IIR, and timeouts
+     * all use the unmodified poll timestamp. Only the scheduler's
+     * advance computation subtracts the measured latency. */
+    if (pData->timing.hasPrevZcHR &&
+        pData->timing.stepPeriodHR > 0 &&
+        pData->timing.stepPeriodHR < DMA_ZC_DIRECT_THRESHOLD_HR)
+    {
+        bool risingZc = (commutationTable[pData->currentStep].zcPolarity > 0);
+        int16_t correction = 0;
+        uint16_t refined = HAL_ZcDma_RefineTimestamp(
+            hrTick,
+            DMA_ZC_DIRECT_MAX_CORRECTION_HR,
+            risingZc,
+            &correction);
+
+        if (refined != hrTick)
+        {
+            /* correction = (refined - pollHR), negative since refined
+             * is earlier. This is the raw poll latency. Store it for
+             * the scheduler — DO NOT modify hrTick. */
+            pData->dmaShadow.substituteCount++;
+            pData->dmaShadow.lastCorrectionHR = correction;
+            if (correction < pData->dmaShadow.minCorrectionHR)
+                pData->dmaShadow.minCorrectionHR = correction;
+            if (correction > pData->dmaShadow.maxCorrectionHR)
+                pData->dmaShadow.maxCorrectionHR = correction;
+
+            /* IIR-smooth the latency for stable scheduler correction.
+             * Use unsigned magnitude (correction is negative). */
+            uint16_t latency = (correction < 0)
+                ? (uint16_t)(-correction) : 0u;
+            if (pData->dmaShadow.smoothedLatencyHR == 0)
+                pData->dmaShadow.smoothedLatencyHR = latency;
+            else
+                pData->dmaShadow.smoothedLatencyHR = (uint16_t)(
+                    ((uint32_t)pData->dmaShadow.smoothedLatencyHR * 7u
+                     + latency) >> 3);
+        }
+        else
+        {
+            pData->dmaShadow.substituteSkipRange++;
+        }
+    }
+    else if (pData->timing.hasPrevZcHR)
+    {
+        pData->dmaShadow.substituteSkipGated++;
+    }
+#endif /* FEATURE_DMA_ZC_DIRECT */
+
     if (pData->timing.hasPrevZc)
     {
         uint16_t interval = zcTick - pData->timing.lastZcTick;
@@ -991,6 +1627,165 @@ void RecordZcTiming(volatile GARUDA_DATA_T *pData,
     pData->timing.goodZcCount++;
     pData->timing.consecutiveMissedSteps = 0;
 
+#if FEATURE_IC_DMA_SHADOW
+    /* DMA shadow probe — compare the hardware-precise DMA ring against
+     * the poll-accepted timestamp and the predictor's expected ZC.
+     * Results are logged into dmaShadow for telemetry. Shadow-only:
+     * no effect on live scheduling. */
+    if (pData->timing.hasPrevZcHR)
+    {
+        uint16_t prevHR       = pData->timing.prevZcTickHR;
+        uint16_t prevInterval = pData->timing.prevZcIntervalHR;
+        if (prevInterval == 0) prevInterval = pData->timing.zcIntervalHR;
+        uint16_t halfInterval = prevInterval >> 1;
+        uint16_t windowOpenHR = prevHR + halfInterval;
+        uint16_t expectedHR   = prevHR + prevInterval;
+        bool risingZc = (commutationTable[pData->currentStep].zcPolarity > 0);
+
+        HAL_ZcDma_Result probe;
+        HAL_ZcDma_Probe(windowOpenHR, expectedHR, hrTick, risingZc, &probe);
+
+        pData->dmaShadow.stepCount++;
+        pData->dmaShadow.edgesInWindowSum += probe.edgeCount;
+        pData->dmaShadow.lastEdgeCount = probe.edgeCount;
+        pData->dmaShadow.lastFound = probe.found;
+        if (probe.ringWrappedSinceMark)
+            pData->dmaShadow.ringOverflowCount++;
+        if (probe.found)
+        {
+            pData->dmaShadow.matchCount++;
+            pData->dmaShadow.lastEarliestVsPoll     = probe.earliestVsPoll;
+            pData->dmaShadow.lastEarliestVsExpected = probe.earliestVsExpected;
+            pData->dmaShadow.lastClosestVsExpected  = probe.closestVsExpected;
+        }
+        pData->dmaShadow.lastPollVsExpected =
+            (int16_t)(hrTick - expectedHR);
+
+#if FEATURE_DMA_BURST_CAPTURE
+        /* Snapshot this step for the burst capture (research tool). */
+        HAL_DmaBurst_OnZc(hrTick, expectedHR, false);
+#endif
+    }
+#endif
+
+#if FEATURE_IC_DMA_SHADOW
+    /* ── Poll-bounded DMA timestamp (bootstrap) ────────────────────
+     * After poll accepted at hrTick, run the windowed DMA detector
+     * with close = hrTick. This produces a hardware-precise ZC
+     * timestamp bounded by the poll acceptance — the validated
+     * offline selector rule ("last ≥2 cluster before poll").
+     *
+     * Result stored in dmaShadow for:
+     *   1. Shadow telemetry (compare DMA vs poll per step)
+     *   2. Future DPLL consumption (phaseBiasHR update from DMA)
+     *   3. Future predicted-close comparison (once DPLL locks)
+     *
+     * Does NOT affect live scheduling. Poll still owns everything.
+     * dmaZcHR is hoisted to function scope for DPLL consumption. */
+    uint16_t dmaZcHR = 0;
+    bool     dmaFound = false;
+    /* Zero per-step telemetry — only set when DMA is actually used.
+     * Prevents stale Corr values from appearing in snapshot when DMA
+     * stops feeding the DPLL (e.g. during predictive ownership). */
+    pData->dmaShadow.lastCorrectionHR = 0;
+    pData->dmaShadow.measSource = 0;  /* 0=none */
+    /* DMA probe: run at any speed where DMA ring has data.
+     * Was previously gated at ZC_IC_DIRECT_THRESHOLD_HR (62k eRPM).
+     * Lowered to ~26k eRPM (600 HR) so the shadow sector PI can get
+     * measurements at lower speeds for debugging. The DMA ring captures
+     * edges at all speeds — this gate only controls when we read it. */
+    if (pData->timing.hasPrevZcHR &&
+        pData->timing.stepPeriodHR > 0 &&
+        pData->timing.stepPeriodHR < 600u)
+    {
+        bool risingZc = (commutationTable[pData->currentStep].zcPolarity > 0);
+        uint16_t windowOpenHR = pData->timing.prevZcTickHR +
+            (pData->zcCtrl.refIntervalHR >> 1);
+
+        dmaFound = HAL_ZcDma_DetectZc(
+            windowOpenHR, hrTick, risingZc, &dmaZcHR);
+
+        if (dmaFound)
+        {
+            int16_t dmaVsPoll = (int16_t)(dmaZcHR - hrTick);
+            pData->dmaShadow.lastCorrectionHR = dmaVsPoll;
+            pData->dmaShadow.substituteCount++;
+            if (dmaVsPoll < pData->dmaShadow.minCorrectionHR)
+                pData->dmaShadow.minCorrectionHR = dmaVsPoll;
+            if (dmaVsPoll > pData->dmaShadow.maxCorrectionHR)
+                pData->dmaShadow.maxCorrectionHR = dmaVsPoll;
+
+            /* IIR-smooth the latency for DPLL consumption */
+            uint16_t latency = (dmaVsPoll < 0)
+                ? (uint16_t)(-dmaVsPoll) : 0u;
+            if (pData->dmaShadow.smoothedLatencyHR == 0)
+                pData->dmaShadow.smoothedLatencyHR = latency;
+            else
+                pData->dmaShadow.smoothedLatencyHR = (uint16_t)(
+                    ((uint32_t)pData->dmaShadow.smoothedLatencyHR * 7u
+                     + latency) >> 3);
+
+            /* DMA timestamp is NOT substituted into lastZcTickHR.
+             * The reactive advance law (delayHR = half - TAL*sp/8)
+             * was calibrated for poll timing — TAL bakes in poll
+             * latency compensation. Substituting an earlier DMA
+             * timestamp makes margin WORSE (target further in past)
+             * because the latency removal is double-counted.
+             *
+             * DMA feeds the DPLL (which has its own advance model)
+             * and telemetry only. */
+            if (dmaVsPoll >= -40 && dmaVsPoll <= -10)
+            {
+                pData->dmaShadow.measSource = 2;  /* DMA-gated */
+            }
+        }
+        else
+        {
+            pData->dmaShadow.substituteSkipRange++;
+        }
+
+#if FEATURE_6STEP_DPLL
+        /* ── Predicted-close DMA detector (parallel shadow) ────────
+         * Run a SECOND windowed detector with close = predZcHR + margin
+         * instead of pollHR. Compare its result against the poll-bounded
+         * one. When both consistently find the same cluster, the
+         * predicted close can replace poll — breaking the circular
+         * dependency.
+         *
+         * Margin: +60 HR (~38 µs) accounts for ±50 HR DPLL phase error.
+         * Clamped to pollHR so we never look past the poll acceptance. */
+        if (pData->zcPred.predZcHR != 0 && pData->zcPred.predStepHR > 0)
+        {
+            uint16_t predCloseHR = (uint16_t)(pData->zcPred.predZcHR + 60u);
+            /* Don't extend past poll */
+            if ((int16_t)(predCloseHR - hrTick) > 0)
+                predCloseHR = hrTick;
+
+            uint16_t predDmaZcHR = 0;
+            bool predDmaFound = HAL_ZcDma_DetectZc(
+                windowOpenHR, predCloseHR, risingZc, &predDmaZcHR);
+
+            if (predDmaFound && dmaFound)
+            {
+                /* Both found a cluster — compare midpoints */
+                int16_t delta = (int16_t)(predDmaZcHR - dmaZcHR);
+                int16_t absDelta = (delta < 0) ? -delta : delta;
+                if (absDelta <= 5)  /* within 3.2 µs = same cluster */
+                    pData->zcPred.predCloseAgreeCount++;
+                else
+                    pData->zcPred.predCloseDisagreeCount++;
+            }
+            else if (predDmaFound != dmaFound)
+            {
+                /* One found, other didn't */
+                pData->zcPred.predCloseDisagreeCount++;
+            }
+            /* Both not found = no data, don't count */
+        }
+#endif
+    }
+#endif
+
     /* Per-polarity and per-step diagnostic counters */
     if (commutationTable[pData->currentStep].zcPolarity > 0)
         pData->zcDiag.diagRisingZcCount++;
@@ -1004,6 +1799,490 @@ void RecordZcTiming(volatile GARUDA_DATA_T *pData,
 
     /* First confirmed CL ZC clears bypass suppression */
     pData->timing.bypassSuppressed = false;
+
+    /* ── PLL Predictor: phase error computation (Step 1 shadow) ──────
+     * Compare actual ZC against TWO models to isolate error source:
+     * Model A (nominal): predZcHR = comm + half + advance
+     * Model B (reactive): comm + lastRealZcDelay (empirical)
+     *
+     * Positive phaseErr = ZC arrived later than predicted.
+     * Negative phaseErr = ZC arrived earlier than predicted. */
+    if (pData->zcPred.predZcHR != 0 && pData->zcPred.predStepHR > 0)
+    {
+        /* Model A: nominal predictor */
+        int16_t phaseErr = (int16_t)(hrTick - pData->zcPred.predZcHR);
+        pData->zcPred.phaseErrHR = phaseErr;
+
+        /* Model B: reactive (comm + last observed ZC delay) */
+        if (pData->zcPred.lastRealZcDelayHR > 0)
+        {
+            uint16_t reactiveZcHR = pData->zcPred.lastCommHR
+                                    + pData->zcPred.lastRealZcDelayHR;
+            pData->zcPred.phaseErrReactiveHR =
+                (int16_t)(hrTick - reactiveZcHR);
+        }
+
+        /* Record actual comm-to-ZC delay */
+        uint16_t actualDelayHR =
+            (uint16_t)(hrTick - pData->zcPred.lastCommHR);
+        pData->zcPred.lastRealZcDelayHR = actualDelayHR;
+
+        /* Update adaptive phase offset via IIR: 7/8 old + 1/8 measured.
+         * Always update when predictor has valid state — the predictor
+         * must keep tracking to converge, even when not locked/gated.
+         * The 25%-75% clamp protects against outlier corruption.
+         * RED zone ZCs still update (they're accepted, just not trusted
+         * for predictive scheduling). */
+        if (pData->zcPred.predZcOffsetHR > 0)
+        {
+            uint16_t minOff = pData->zcPred.predStepHR >> 2;  /* 25% */
+            uint16_t maxOff = pData->zcPred.predStepHR -
+                              (pData->zcPred.predStepHR >> 2);  /* 75% */
+            uint16_t clampedDelay = actualDelayHR;
+            if (clampedDelay < minOff) clampedDelay = minOff;
+            if (clampedDelay > maxOff) clampedDelay = maxOff;
+            pData->zcPred.predZcOffsetHR = (uint16_t)(
+                ((uint32_t)pData->zcPred.predZcOffsetHR * 7
+                 + clampedDelay) >> 3);
+        }
+        else if (pData->zcPred.predZcOffsetHR == 0 &&
+                 actualDelayHR > 0)
+        {
+            /* Re-seed after RED zone disarm */
+            pData->zcPred.predZcOffsetHR = actualDelayHR;
+        }
+
+#if FEATURE_6STEP_DPLL
+        /* ── DPLL measurement update ───────────────────────────────
+         * Model: t_zc_pred = lastComm + T_hat/2 + A_cmd + phaseBias
+         * Error: e = t_meas - t_zc_pred
+         * Update: phaseBias += e/8  (Kp = 1/8)
+         *
+         * t_meas source (bootstrap progression):
+         *   - If poll-bounded DMA found a cluster: use dmaZcHR
+         *     (hardware-precise, 1.3-7 µs stdev, ~20 ticks earlier)
+         *   - Else: fall back to hrTick (poll timestamp)
+         *
+         * With DMA as measurement, phaseBiasHR absorbs ~20 ticks
+         * LESS poll latency → converges to a value ~20 ticks higher
+         * than with poll-only. This is correct: the bias reflects
+         * the actual phase offset without poll delay. */
+        if (pData->zcPred.phaseBiasHR == 0 &&
+            pData->zcPred.predZcOffsetHR > 0 &&
+            pData->zcPred.predStepHR > 0)
+        {
+            pData->zcPred.phaseBiasHR = (int16_t)(
+                pData->zcPred.predZcOffsetHR
+                - (pData->zcPred.predStepHR >> 1)
+                - pData->zcPred.advanceCmdHR);
+        }
+
+        {
+            /* Select measurement source with plausibility gate.
+             * The DMA detector sometimes picks the wrong cluster
+             * (previous PWM cycle or noise). Gate: only use DMA
+             * if the correction is within a sane band around the
+             * smoothed latency. Otherwise fall back to poll. */
+            bool dmaUsed = false;
+            uint16_t tMeas = hrTick;  /* default: poll */
+
+            if (dmaFound)
+            {
+                int16_t dmaVsPoll = (int16_t)(dmaZcHR - hrTick);
+                /* Sane band: -40 to -10 HR ticks (6-26 µs before poll).
+                 * Main band from offline analysis: -15 to -35 HR.
+                 * This rejects previous-burst picks (-58/-61) and
+                 * deep outliers (-90 to -145). */
+                if (dmaVsPoll >= -40 && dmaVsPoll <= -10)
+                {
+                    tMeas = dmaZcHR;
+                    dmaUsed = true;
+                }
+            }
+
+            /* Compute phase advance — must match reactive's advance law
+             * to avoid a phase jump at handoff. Reactive uses
+             * AdaptiveTimingAdvance(eRPM) which gives TAL levels:
+             *   TAL=3: 22.5° (below 75k)
+             *   TAL=2: 15°   (75k-115k)
+             *   TAL=1: 7.5°  (above 115k)
+             *
+             * advanceCmdHR = (predStepHR / 8) * TAL, same as reactive's
+             * advHR = (spHR / 8) * TAL. Using lastReactiveTAL ensures
+             * perfect continuity at handoff. */
+            pData->zcPred.advanceCmdHR =
+                (pData->zcPred.predStepHR >> 3)
+                * pData->zcPred.lastReactiveTAL;
+
+            uint16_t dpllPredZc = (uint16_t)(
+                pData->zcPred.lastCommHR
+                + (pData->zcPred.predStepHR >> 1)
+                + pData->zcPred.advanceCmdHR
+                + (uint16_t)pData->zcPred.phaseBiasHR);
+
+            int16_t dpllErr = (int16_t)(tMeas - dpllPredZc);
+
+            /* Bias update: Kp = 1/8. Tried 1/4 — made predicted-close
+             * agreement WORSE (70% vs 79%) because the bias swings
+             * too aggressively on per-step jitter. */
+            int16_t newBias = pData->zcPred.phaseBiasHR + (dpllErr >> 3);
+
+            /* Clamp to ±T_hat/2 */
+            int16_t bmax = (int16_t)(pData->zcPred.predStepHR >> 1);
+            if (newBias >  bmax) newBias =  bmax;
+            if (newBias < -bmax) newBias = -bmax;
+
+            pData->zcPred.phaseBiasHR = newBias;
+
+            /* Phase-error-to-frequency integral (Ki = 1/128).
+             *
+             * This is the PLL's integral path. Bias (Kb=1/8) is the
+             * proportional path. Together they form a Type-2 PLL:
+             *   bias absorbs phase steps instantly
+             *   T_hat tracks frequency changes slowly
+             *
+             * Without this, T_hat deadlocks in predictive mode because
+             * zcIntervalHR = T_hat → IIR sees zero error → T_hat fixed.
+             *
+             * Ki = 1/128: at 75k with sustained error of -20 (motor
+             * wants to go faster), correction = 20/128 = 0.156 HR/step.
+             * Over 83 steps (~7 ms) this accumulates 13 HR = 5k eRPM
+             * of speed change. Fast enough for throttle response, slow
+             * enough to reject per-step jitter (±50 HR → ±0.4 HR). */
+            {
+                int16_t freqCorr = dpllErr >> 7;  /* Ki = 1/128 */
+                int16_t newStep = (int16_t)pData->zcPred.predStepHR + freqCorr;
+                if (newStep < 50) newStep = 50;
+                if (newStep > 2000) newStep = 2000;  /* ~7.8k eRPM min */
+                pData->zcPred.predStepHR = (uint16_t)newStep;
+            }
+
+            pData->zcPred.dpllErrHR = dpllErr;
+            pData->zcPred.lastMeasTsHR = tMeas;
+            if (dmaUsed)
+            {
+                pData->zcPred.dmaMeasUsedCount++;
+            }
+            else
+            {
+                if (dmaFound)
+                    pData->zcPred.dmaMeasRejectCount++;
+            }
+        }
+#endif /* FEATURE_6STEP_DPLL */
+
+#if FEATURE_SECTOR_PI && FEATURE_IC_DMA_SHADOW
+        /* ── Sector PI shadow synchronizer ────────────────────────
+         * On each poll-accepted ZC, query the DMA ring for the
+         * hardware-captured ZC cluster closest to the expected
+         * position within the sector. Compute phase error and
+         * run PI to update T_hat. Does NOT affect scheduling.
+         *
+         * Model (from Microchip AVR high-speed motor.c:437):
+         *   capValueHR = measHR - lastCommHR
+         *   setValueHR = T_hat/2 + detDelay + advanceCmd
+         *   syncErrHR  = capValue - setValue
+         *   syncIntHR += syncErr >> KI_SHIFT
+         *   T_hatHR    = syncIntHR + (syncErr >> KP_SHIFT)
+         */
+        if (pData->zcSync.mode >= 1 &&  /* SHADOW or OWNED */
+            pData->zcSync.T_hatHR > 0)
+        {
+            /* Shadow PI measurement: use the poll-bounded DMA timestamp
+             * (dmaZcHR from HAL_ZcDma_DetectZc above, with close=pollHR).
+             * This gives 79% acceptance with validated timestamps vs
+             * 5-13% from the autonomous corridor selector.
+             *
+             * The poll-bounded selector finds the last ≥2-edge cluster
+             * before the poll acceptance time — the same cluster the
+             * legacy shadow probe uses. The plausibility gate (-40 to
+             * -10 HR) already validated it.
+             *
+             * For ownership (Phase 5), an autonomous selector will be
+             * needed. That is a separate experiment to run in parallel
+             * with this validated measurement source. */
+            uint8_t searchTal = pData->zcPred.lastReactiveTAL;
+
+            /* Use poll-bounded DMA timestamp if available and plausible */
+            bool syncMeasValid = false;
+            uint16_t syncMeasHR = 0;
+
+            if (dmaFound)
+            {
+                int16_t dmaVsPoll = (int16_t)(dmaZcHR - hrTick);
+                /* Gate: DMA cluster must be before poll but not too far.
+                 * Old gate was -40 to -10. The -10 lower bound rejected
+                 * valid clusters at high speed where poll accepts fast
+                 * and the DMA-poll gap shrinks to 0-10 HR. This biased
+                 * capValueHR early, causing the -25 HR T_hat gap.
+                 * Widened to -40 to 0 — any DMA cluster at or before
+                 * poll is accepted. */
+                if (dmaVsPoll >= -40 && dmaVsPoll <= 0)
+                {
+                    syncMeasHR = dmaZcHR;
+                    syncMeasValid = true;
+                }
+            }
+
+            if (syncMeasValid)
+            {
+                uint16_t capValueHR = syncMeasHR - pData->zcSync.lastCommHR;
+                /* PI model: use reactive TAL so setValueHR matches
+                 * where the motor actually operates. */
+                uint16_t modelAdvHR = (pData->zcSync.T_hatHR >> 3) * searchTal;
+                /* Microchip ADDS RC delay because their filter makes
+                 * the capture arrive LATE. Our DMA captures EARLY
+                 * (before poll), so we SUBTRACT the detector offset.
+                 * capValue = trueElapsed - dmaEarlyOffset
+                 * setValue must match: T_hat/2 + adv - detDelay */
+                uint16_t setValueHR = (pData->zcSync.T_hatHR >> 1)
+                                    + modelAdvHR
+                                    - pData->zcSync.detDelayHR;
+                int16_t errHR = (int16_t)(capValueHR - setValueHR);
+
+                /* PI update — unbiased rounding on right shift.
+                 * Arithmetic right shift of negative values truncates
+                 * toward -∞: (-12 >> 4) = -1, but (+12 >> 4) = 0.
+                 * This ratchets the integrator downward even when the
+                 * mean error is zero. Fix: negate-shift-negate for
+                 * negative values to get symmetric truncation toward 0. */
+                int16_t kiCorr = (errHR >= 0)
+                    ? (errHR >> ZC_SYNC_KI_SHIFT)
+                    : -((-errHR) >> ZC_SYNC_KI_SHIFT);
+                int16_t kpCorr = (errHR >= 0)
+                    ? (errHR >> ZC_SYNC_KP_SHIFT)
+                    : -((-errHR) >> ZC_SYNC_KP_SHIFT);
+
+                int32_t newInt = (int32_t)pData->zcSync.syncIntHR + kiCorr;
+                if (newInt < 50) newInt = 50;
+                if (newInt > 2000) newInt = 2000;
+                pData->zcSync.syncIntHR = (uint16_t)newInt;
+
+                int32_t newT = (int32_t)pData->zcSync.syncIntHR + kpCorr;
+                if (newT < 50) newT = 50;
+                if (newT > 2000) newT = 2000;
+                pData->zcSync.T_hatHR = (uint16_t)newT;
+
+                /* Per-sector telemetry */
+                pData->zcSync.capValueHR  = capValueHR;
+                pData->zcSync.setValueHR  = setValueHR;
+                pData->zcSync.syncErrHR   = errHR;
+                pData->zcSync.clusterMidHR = syncMeasHR;
+                pData->zcSync.clusterCount = 2; /* poll-bounded: at least 2 */
+                pData->zcSync.clusterWidthHR = 0; /* not available from legacy */
+                pData->zcSync.lastMeasHR  = syncMeasHR;
+                pData->zcSync.diagSyncAccepts++;
+                pData->zcSync.missStreak  = 0;
+
+                /* Streak tracking */
+                int16_t absErr = (errHR >= 0) ? errHR : -errHR;
+                if (absErr < (int16_t)(pData->zcSync.T_hatHR >> 3))
+                {
+                    if (pData->zcSync.goodStreak < 255)
+                        pData->zcSync.goodStreak++;
+                }
+                else
+                    pData->zcSync.goodStreak = 0;
+
+                /* SvR comparison deferred — lastReactiveTargetHR is
+                 * not updated until ScheduleCommutation runs after
+                 * RecordZcTiming returns. Set to 0 to avoid stale data. */
+                pData->zcSync.syncVsReactiveDelta = 0;
+
+                /* Update advanceCmdHR — stores the sync model's own
+                 * advance for future ownership mode. In shadow mode
+                 * the PI model uses searchTal-based advance instead. */
+                pData->zcSync.advanceCmdHR = (uint16_t)(
+                    (uint32_t)ZC_SYNC_ADVANCE_FP8
+                    * pData->zcSync.T_hatHR >> 8);
+            }
+            else
+            {
+                /* Poll-bounded DMA not available or failed plausibility */
+                pData->zcSync.diagSyncMisses++;
+                pData->zcSync.clusterRejectReason =
+                    dmaFound ? 3 : 1;  /* 3=out_of_corridor(gate), 1=no_edges */
+                if (pData->zcSync.missStreak < 255)
+                    pData->zcSync.missStreak++;
+                pData->zcSync.goodStreak = 0;
+            }
+        }
+#endif /* FEATURE_SECTOR_PI */
+
+        /* Accumulate |phaseErr| for telemetry averaging */
+        uint16_t absErr = (phaseErr >= 0) ? (uint16_t)phaseErr
+                                          : (uint16_t)(-phaseErr);
+        pData->zcPred.diagPhaseErrAccum += absErr;
+
+        /* Check if ZC fell within scan window */
+        int16_t sinceOpen = (int16_t)(hrTick - pData->zcPred.scanOpenHR);
+        int16_t sinceClose = (int16_t)(hrTick - pData->zcPred.scanCloseHR);
+        if (sinceOpen >= 0 && sinceClose <= 0)
+            pData->zcPred.diagZcInWindow++;
+        else
+            pData->zcPred.diagZcOutWindow++;
+
+        /* Frequency correction: adjust predStepHR toward actual interval.
+         * IIR: 7/8 old + 1/8 correction. Tried 3/4 + 1/4 — made
+         * predicted-close agreement worse by amplifying jitter. */
+        if (pData->timing.hasPrevZcHR && pData->timing.zcIntervalHR > 0)
+        {
+            uint16_t actualStepHR = pData->timing.zcIntervalHR;
+            uint16_t minStep = pData->zcPred.predStepHR >> 1;
+            uint16_t maxStep = pData->zcPred.predStepHR +
+                               (pData->zcPred.predStepHR >> 1);
+            if (actualStepHR >= minStep && actualStepHR <= maxStep)
+            {
+                pData->zcPred.predStepHR = (uint16_t)(
+                    ((uint32_t)pData->zcPred.predStepHR * 7 + actualStepHR)
+                    >> 3);
+            }
+        }
+
+        /* Mark predictor as locked if phase error is small enough
+         * (within 12.5% of step period) */
+        if (absErr < (pData->zcPred.predStepHR >> 3))
+        {
+            pData->zcPred.locked = true;
+            pData->zcPred.missCount = 0;
+        }
+        else if (pData->zcPred.predictiveMode)
+        {
+            /* In predictive mode, ANY accepted ZC is a correction
+             * arriving — reset missCount even if not "locked".
+             * The lock check is for entry decisions, not for proving
+             * the predictor is still receiving feedback. */
+            pData->zcPred.missCount = 0;
+        }
+
+        /* Compute zone classification for entryScore.
+         * Uses the scan window set in OnCommutation. */
+        bool inGreen = false;
+        bool inRed = false;
+        {
+            int16_t sinceOpen = (int16_t)(hrTick - pData->zcPred.scanOpenHR);
+            int16_t sinceClose = (int16_t)(hrTick - pData->zcPred.scanCloseHR);
+            inGreen = (sinceOpen >= 0 && sinceClose <= 0);
+            if (!inGreen)
+            {
+                uint16_t outerHR = pData->zcPred.predStepHR >> 1;
+                uint16_t outerOpen = pData->zcPred.predZcHR - outerHR;
+                uint16_t outerClose = pData->zcPred.predZcHR + outerHR;
+                int16_t sinceOO = (int16_t)(hrTick - outerOpen);
+                int16_t sinceOC = (int16_t)(hrTick - outerClose);
+                inRed = !(sinceOO >= 0 && sinceOC <= 0);
+            }
+        }
+
+        /* ── entryScore: predictive scheduling readiness ──────────
+         * Evaluated HERE with the CURRENT ZC's refreshed data
+         * (phaseErr, locked, offset, stepHR all just updated).
+         *
+         * Scoring:
+         *   GREEN + small |phaseErr| (< stepHR/6): +4
+         *   GREEN + moderate |phaseErr|:           +1
+         *   YELLOW:                                -1
+         *   RED / large |phaseErr| (> stepHR/4):   clear to 0
+         *
+         * Entry threshold: >= 24 (~1 revolution of good ZCs).
+         * Decay-based: occasional YELLOW doesn't kill progress. */
+        {
+            uint16_t smallErr = pData->zcPred.predStepHR / 6;
+            uint16_t largeErr = pData->zcPred.predStepHR >> 2;
+
+            if (inGreen && absErr < smallErr)
+            {
+                if (pData->zcPred.entryScore <= 251)
+                    pData->zcPred.entryScore += 4;
+                else
+                    pData->zcPred.entryScore = 255;
+            }
+            else if (inGreen)
+            {
+                if (pData->zcPred.entryScore < 255)
+                    pData->zcPred.entryScore++;
+            }
+            else if (inRed || absErr > largeErr)
+            {
+                pData->zcPred.entryScore = 0;
+            }
+            else /* YELLOW */
+            {
+                if (pData->zcPred.entryScore > 0)
+                    pData->zcPred.entryScore--;
+            }
+        }
+
+        /* ── Predictive mode entry (post-ZC, current state) ──────
+         * Arm handoff when:
+         * - entryScore high enough (predictor quality proven)
+         * - predictor has valid state
+         * - reactive path is under pressure (recent low margin
+         *   or recent targetPast — not just high speed)
+         * - not already in predictive mode or pending handoff
+         *
+         * The actual scheduling takeover happens in _CCP4Interrupt
+         * on the NEXT commutation after handoffPending is set. */
+#if FEATURE_6STEP_DPLL
+        /* ── DPLL predictive mode entry ────────────────────────────
+         * Enter when the DPLL is tracking well enough. The ISR at
+         * garuda_service.c:1103 will schedule commutations from
+         * lastPredCommHR + predStepHR (= T_hat). */
+        if (!pData->zcPred.predictiveMode &&
+            !pData->zcPred.handoffPending &&
+            pData->zcPred.entryScore >= 24 &&
+            pData->zcPred.predStepHR > 0 &&
+            pData->state == ESC_CLOSED_LOOP)
+        {
+            /* Speed gate: only engage above DPLL_HANDOFF_ERPM */
+            uint32_t erpm = 0;
+            if (pData->zcCtrl.refIntervalHR > 0)
+                erpm = 15625000UL / pData->zcCtrl.refIntervalHR;
+            if (erpm >= DPLL_HANDOFF_ERPM)
+            {
+                pData->zcPred.handoffPending = true;
+                pData->zcPred.fallbackReason = 0;
+            }
+        }
+
+        /* ── DPLL predictive mode exit checks ──────────────────────
+         * Called on every accepted ZC while in predictive mode.
+         * The measurement timeout (missCount > 2) is handled in
+         * BEMF_ZC_CheckTimeout. Here we check phase error.
+         *
+         * Grace period: after entry, the bias IIR needs ~12 steps to
+         * absorb the scheduling discontinuity (predictor target ≠
+         * reactive target at handoff). During graceCount > 0,
+         * phaseErr exits are suppressed. missCount and state exits
+         * remain active for safety. */
+        if (pData->zcPred.predictiveMode)
+        {
+            /* Decrement grace counter */
+            if (pData->zcPred.graceCount > 0)
+                pData->zcPred.graceCount--;
+
+            uint16_t exitThresh = pData->zcPred.predStepHR >> 2; /* T/4 */
+            if (absErr > exitThresh && pData->zcPred.graceCount == 0)
+            {
+                pData->zcPred.predictiveMode = false;
+                pData->zcPred.handoffPending = false;
+                pData->zcPred.fallbackReason = 2; /* phaseErr */
+                pData->zcPred.entryScore = 0;
+                pData->timing.deadlineActive = false;
+            }
+            else if (pData->state != ESC_CLOSED_LOOP)
+            {
+                pData->zcPred.predictiveMode = false;
+                pData->zcPred.handoffPending = false;
+                pData->zcPred.fallbackReason = 5; /* notCL */
+                pData->zcPred.entryScore = 0;
+                pData->timing.deadlineActive = false;
+            }
+        }
+#else
+        /* Predictive entry DISABLED when FEATURE_6STEP_DPLL is off. */
+#endif
+    }
 
     /* ZC V2 mode transitions on good ZC */
     switch (pData->zcCtrl.mode)
@@ -1044,6 +2323,14 @@ bool BEMF_ZC_FastPoll(volatile GARUDA_DATA_T *pData)
 {
     if (pData->bemf.zeroCrossDetected)
         return false;
+
+    /* Speed-adaptive front-end: above ZC_IC_DIRECT_THRESHOLD_HR,
+     * switch from CLC D-FF (25 µs quantization) to raw GPIO
+     * (0.64 µs resolution). This recovers ~25 µs of front-end
+     * latency that was consuming the entire reactive delay budget
+     * at 80-90k eRPM. */
+    useRawFrontEnd = (pData->timing.stepPeriodHR > 0 &&
+                      pData->timing.stepPeriodHR < ZC_IC_DIRECT_THRESHOLD_HR);
 
     pData->icZc.diagPollCycles++;
 
@@ -1095,7 +2382,62 @@ bool BEMF_ZC_FastPoll(volatile GARUDA_DATA_T *pData)
             return false;  /* Too early — reject (demag/noise) */
     }
 
-    /* Read comparator for the floating phase */
+#if FEATURE_DMA_PRIMARY_ZC && FEATURE_IC_DMA_SHADOW
+    /* ── DMA-primary ZC detection ─────────────────────────────────
+     * Above the speed threshold, query the DMA ring for a qualifying
+     * edge cluster instead of reading GPIO with multi-read filtering.
+     *
+     * The DMA ring has hardware-precise timestamps of every comparator
+     * edge. We walk it looking for a ≥2-edge cluster within a window:
+     *   open  = lastZcTickHR + halfInterval  (50% gate, already passed above)
+     *   close = now                          (don't look into future)
+     *
+     * If found: accept immediately with DMA timestamp, skip poll filter.
+     * If not found: fall through to existing poll/raw path (fallback).
+     *
+     * This eliminates ~16 µs of poll filter latency. At 100k eRPM
+     * that turns margin from -16 HR to roughly +9 HR. */
+    if (pData->timing.stepPeriodHR > 0 &&
+        pData->timing.stepPeriodHR < DMA_ZC_DIRECT_THRESHOLD_HR &&
+        pData->zcCtrl.mode == ZC_MODE_TRACK)
+    {
+        bool risingZc = (commutationTable[pData->currentStep].zcPolarity > 0);
+        uint16_t windowOpenHR = pData->timing.lastZcTickHR +
+            (pData->zcCtrl.refIntervalHR >> 1);
+        uint16_t windowCloseHR = HAL_ComTimer_ReadTimer();
+        uint16_t dmaZcHR = 0;
+
+        if (HAL_ZcDma_DetectZc(windowOpenHR, windowCloseHR,
+                               risingZc, &dmaZcHR))
+        {
+            /* Convert DMA HR timestamp to Timer1 domain for RecordZcTiming */
+            uint16_t nowHR = windowCloseHR;
+            uint16_t age = nowHR - dmaZcHR;
+            uint16_t ageT1 = (uint16_t)((uint32_t)age * COM_TIMER_T1_DENOM
+                                         / COM_TIMER_T1_NUMER);
+            uint16_t tsT1 = pData->timer1Tick - ageT1;
+
+            pData->bemf.zeroCrossDetected = true;
+            RecordZcTiming(pData, tsT1, dmaZcHR);
+
+            if (pData->bemf.zeroCrossDetected)
+            {
+                pData->icZc.diagDmaPrimaryAccept++;
+                pData->icZc.phase = IC_ZC_DONE;
+                return true;
+            }
+            /* RecordZcTiming rejected — reset and fall through to poll */
+            pData->icZc.pollFilter = 0;
+            pData->icZc.rawCoro = 0;
+            pData->icZc.hasFirstClcMatch = false;
+            pData->icZc.hasRawFirstMatch = false;
+        }
+        /* No qualifying cluster yet — fall through to poll/raw path.
+         * Poll continues as fallback for steps where DMA has no match. */
+    }
+#endif /* FEATURE_DMA_PRIMARY_ZC */
+
+    /* Read comparator for the floating phase. */
     uint8_t cmp = ReadBEMFComparator(pData->icZc.activeChannel);
 
     /* Raw comparator edge trace — count transitions per step */
@@ -1111,70 +2453,342 @@ bool BEMF_ZC_FastPoll(volatile GARUDA_DATA_T *pData)
     }
 
     /* ZC V2 Phase 3: strict polarity in all modes.
-     * Never accept wrong-polarity comparator state.
-     * AM32/ESCape32 never do this. Bench data confirms:
-     * Rising ZC=19939, Falling ZC=19924, both TO=0 — the comparator
-     * detects both polarities perfectly. The old bypass was the root
-     * cause of every cascade failure, not a necessary workaround.
-     * If ZC is missed, the timeout fires and mode transitions handle
-     * recovery (TRACK → RECOVER → ACQUIRE → TRACK). */
+     * Never accept wrong-polarity comparator state. */
     uint8_t expected = pData->bemf.cmpExpected;
+
+    /* Read corroboration channel in parallel with primary (TRACK only).
+     *
+     * Normal mode (CLC primary): rawCmp = raw GPIO.
+     *   Catches stale CLC D-FF holds and noise-coincidence fast accepts.
+     *
+     * Raw-primary mode (above ZC_IC_DIRECT_THRESHOLD_HR): rawCmp = CLC.
+     *   Raw GPIO is the fast primary; CLC is the filtered sanity check.
+     *   Without this flip, raw-vs-raw corroboration is trivially true
+     *   and the detector accepts PWM noise edges. */
+#if FEATURE_CLC_BLANKING
+    uint8_t rawCmp = useRawFrontEnd
+        ? HAL_CLC_ReadOutput(pData->icZc.activeChannel)
+        : ReadRawBEMFComparator(pData->icZc.activeChannel);
+#else
+    uint8_t rawCmp = ReadRawBEMFComparator(pData->icZc.activeChannel);
+#endif
 
     if (cmp == expected)
     {
+        /* Record first CLC match timestamp for candidateAge fallback */
+        if (!pData->icZc.hasFirstClcMatch)
+        {
+            pData->icZc.firstClcMatchHR = HAL_ComTimer_ReadTimer();
+            pData->icZc.hasFirstClcMatch = true;
+        }
+
+        /* Raw corroboration & stability (candidate-local, TRACK only).
+         * rawCoro: saturating 0..2 counter of consecutive raw matches.
+         * rawFirstMatchHR: scoped to CLC candidate — only starts when
+         * CLC==expected AND raw==expected. Resets on ANY raw mismatch
+         * (not just CLC mismatch) to prevent spanning chatter. */
+        if (pData->zcCtrl.mode == ZC_MODE_TRACK)
+        {
+            if (rawCmp == expected)
+            {
+                if (pData->icZc.rawCoro < 2u)
+                    pData->icZc.rawCoro++;
+                if (!pData->icZc.hasRawFirstMatch)
+                {
+                    pData->icZc.rawFirstMatchHR = HAL_ComTimer_ReadTimer();
+                    pData->icZc.rawFirstMatchT1 = pData->timer1Tick;
+                    pData->icZc.hasRawFirstMatch = true;
+                }
+            }
+            else
+            {
+                /* Raw mismatch — reset raw stability entirely */
+                pData->icZc.rawCoro = 0;
+                pData->icZc.hasRawFirstMatch = false;
+            }
+        }
+
         if (pData->icZc.pollFilter == 0)
         {
 #if FEATURE_IC_ZC_CAPTURE
-            /* If IC already captured a precise timestamp for this
-             * step, keep it. Only write poll timestamp as fallback
-             * if IC hasn't fired. IC fires on the actual edge (640ns),
-             * poll sees it 0-5µs later. */
-            if (pData->icZc.icArmed)
+            /* PWM-aware IC timestamp age validation (no speed gate).
+             * IC may catch a bounce; if stale, use poll time.
+             *
+             * NOTE: previous attempts to make this adaptive
+             * (proportional to step period) and to re-arm on
+             * age-reject both caused regressions in the 60–70 k
+             * eRPM band (Mrgn went negative). Reverted to the
+             * known-working fixed threshold. The IC contribution
+             * is low (~1–3% of timestamps) but the system runs
+             * cleanly on raw poll and the schedule margin stays
+             * positive across the working speed range. */
+            if (pData->icZc.icCandidateValid)
+            {
+                uint16_t now = HAL_ComTimer_ReadTimer();
+                uint16_t icAge = now - pData->icZc.zcCandidateHR;
+                if (icAge > IC_AGE_MAX_HR)
+                {
+                    pData->icZc.zcCandidateHR = now;
+                    pData->icZc.zcCandidateT1 = pData->timer1Tick;
+                    pData->icZc.icCandidateValid = false;
+                    pData->icZc.diagIcAgeReject++;
+                }
+            }
+            else if (pData->icZc.icArmed)
+#else
+            if (true)
 #endif
             {
-                /* No IC capture — use poll timestamp (5µs precision) */
                 pData->icZc.zcCandidateHR = HAL_ComTimer_ReadTimer();
                 pData->icZc.zcCandidateT1 = pData->timer1Tick;
             }
         }
         pData->icZc.pollFilter++;
 
-#if FEATURE_CLC_BLANKING
-        /* CLC D-FF output is clean. In TRACK mode: 1 read enough.
-         * In ACQUIRE: use full deglitch (CL entry has stale CLC
-         * state from ForcePreZcState → false accepts without filter). */
-        if (pData->icZc.pollFilter >=
-            (pData->zcCtrl.mode == ZC_MODE_TRACK ? 1 : pData->icZc.filterLevel))
-#else
-        if (pData->icZc.pollFilter >= pData->icZc.filterLevel)
-#endif
+        /* ── TRACK acceptance: detector agreement, no speed gate ──────
+         *
+         * Fast accept: pollFilter >= 1 && rawStable
+         *   rawStable = rawCoro >= 2 (primary: two consecutive raw matches)
+         *            OR (hasRawFirstMatch && rawAge >= RAW_STABLE_AGE_HR)
+         *               (jitter insurance: raw stable for >= 1 poll period,
+         *                covers case where rawCoro is exactly 1 but raw
+         *                has been consistent long enough)
+         *
+         * Safe fallback: pollFilter >= 2 && candidateAge >= 1 PWM cycle
+         *   CLC persisted through a fresh D-FF update (not stale).
+         *
+         * ACQUIRE/RECOVER: full adaptive FL (3-8). */
+        bool accept = false;
+        if (pData->zcCtrl.mode == ZC_MODE_TRACK)
         {
-            /* ZC confirmed! */
-            pData->bemf.zeroCrossDetected = true;
-            RecordZcTiming(pData, pData->icZc.zcCandidateT1,
-                           pData->icZc.zcCandidateHR);
-
-            if (pData->bemf.zeroCrossDetected)
+            bool rawStable = false;
+            if (pData->icZc.rawCoro >= 2u)
             {
-                pData->icZc.diagAccepted++;
-                pData->icZc.phase = IC_ZC_DONE;
-                return true;
+                rawStable = true;  /* primary: two consecutive raw matches */
             }
-            /* RecordZcTiming rejected (too-short interval) — reset */
-            pData->icZc.pollFilter = 0;
+            else if (pData->icZc.hasRawFirstMatch && pData->icZc.rawCoro >= 1u)
+            {
+                uint16_t rawAge = HAL_ComTimer_ReadTimer()
+                                  - pData->icZc.rawFirstMatchHR;
+                if (rawAge >= RAW_STABLE_AGE_HR)
+                    rawStable = true;  /* jitter insurance: stable for 1 poll */
+            }
+
+            if (pData->icZc.pollFilter >= 1u && rawStable)
+            {
+                accept = true;  /* fast path: CLC + raw stably agree */
+            }
+            else if (pData->icZc.pollFilter >= 2u)
+            {
+                uint16_t candidateAge = HAL_ComTimer_ReadTimer()
+                                        - pData->icZc.firstClcMatchHR;
+                if (candidateAge >= PWM_PERIOD_HR)
+                {
+                    accept = true;  /* fallback: CLC survived a D-FF refresh */
+                    pData->icZc.diagTrackFallback++;
+                }
+                else if (pData->icZc.rawCoro >= 1u)
+                {
+                    /* Raw was present but not stable enough for fast path */
+                    pData->icZc.diagRawStableBlock++;
+                }
+                else
+                {
+                    pData->icZc.diagRawVeto++;
+                }
+            }
+        }
+        else
+        {
+            /* ACQUIRE/RECOVER: use full adaptive filter */
+            if (pData->icZc.pollFilter >= pData->icZc.filterLevel)
+                accept = true;
+        }
+
+        if (accept)
+        {
+            /* ── Timestamp selection by confidence ────────────────────
+             * Select best ZC timestamp AFTER acceptance is decided.
+             * IC lead check is a timestamp downgrade only — never
+             * affects whether the ZC is accepted.
+             *
+             * Preferred: IC (if valid and doesn't lead raw too much)
+             * Fallback 1: rawFirstMatchHR (first stable raw observation)
+             * Fallback 2: firstClcMatchHR (first CLC match)
+             * Fallback 3: current poll time */
+            uint16_t tsHR = pData->icZc.zcCandidateHR;
+            uint16_t tsT1 = pData->icZc.zcCandidateT1;
+
+#if FEATURE_IC_ZC_CAPTURE
+            if (pData->icZc.icCandidateValid && pData->icZc.hasRawFirstMatch)
+            {
+                /* Check IC lead vs raw stability */
+                int16_t icLead = (int16_t)(pData->icZc.rawFirstMatchHR
+                                           - pData->icZc.zcCandidateHR);
+                if (icLead > (int16_t)IC_LEAD_MAX_HR)
+                {
+                    /* IC fired too far ahead of raw — bounce, downgrade */
+                    tsHR = pData->icZc.rawFirstMatchHR;
+                    tsT1 = pData->icZc.rawFirstMatchT1;
+                    pData->icZc.diagIcLeadReject++;
+                    pData->icZc.diagTsFromRaw++;
+                }
+                else
+                {
+                    /* IC is fresh and consistent with raw — best source */
+                    pData->icZc.diagTsFromIc++;
+                }
+            }
+            else if (pData->icZc.icCandidateValid)
+            {
+                /* IC valid but no raw reference — trust IC */
+                pData->icZc.diagTsFromIc++;
+            }
+            else
+#endif
+            if (pData->icZc.hasRawFirstMatch)
+            {
+                /* No valid IC — use raw first match */
+                tsHR = pData->icZc.rawFirstMatchHR;
+                tsT1 = pData->icZc.rawFirstMatchT1;
+                pData->icZc.diagTsFromRaw++;
+            }
+            else if (pData->icZc.hasFirstClcMatch)
+            {
+                /* No raw either — use CLC first match */
+                tsHR = pData->icZc.firstClcMatchHR;
+                tsT1 = pData->icZc.zcCandidateT1;  /* best T1 available */
+                pData->icZc.diagTsFromClc++;
+            }
+            else
+            {
+                /* Nothing — use current poll time (already in tsHR/tsT1) */
+                pData->icZc.diagTsFromPoll++;
+            }
+
+            /* ── Step 2: 3-zone confidence model ─────────────────────
+             * Window supervises the predictor, does NOT gate acceptance.
+             * ZC is always accepted if Phase 2 says valid.
+             *
+             * GREEN: inside ±25% → normal predictor update, trust high
+             * YELLOW: outside ±25% but inside ±50% → accept ZC, skip
+             *         predictor correction, count warning
+             * RED: outside ±50% → accept ZC, disarm predictor trust,
+             *      do not use for predictor update */
+            if (pData->zcCtrl.mode == ZC_MODE_TRACK &&
+                pData->zcPred.predZcOffsetHR > 0)
+            {
+                int16_t sinceOpen = (int16_t)(tsHR - pData->zcPred.scanOpenHR);
+                int16_t sinceClose = (int16_t)(tsHR - pData->zcPred.scanCloseHR);
+                bool inGreen = (sinceOpen >= 0 && sinceClose <= 0);
+
+                /* Outer guard band: ±50% of step period */
+                uint16_t outerHR = pData->zcPred.predStepHR >> 1;
+                uint16_t outerOpen = pData->zcPred.predZcHR - outerHR;
+                uint16_t outerClose = pData->zcPred.predZcHR + outerHR;
+                int16_t sinceOuterOpen = (int16_t)(tsHR - outerOpen);
+                int16_t sinceOuterClose = (int16_t)(tsHR - outerClose);
+                bool inYellow = !inGreen &&
+                    (sinceOuterOpen >= 0 && sinceOuterClose <= 0);
+                bool inRed = !inGreen && !inYellow;
+
+                /* Telemetry */
+                if (pData->zcPred.gateActive)
+                {
+                    if (inGreen)
+                        pData->zcPred.diagWinCandInGated++;
+                    else
+                        pData->zcPred.diagWinCandOutGated++;
+                }
+
+                if (!inGreen)
+                {
+                    if (sinceOpen < 0)
+                        pData->zcPred.diagWinOutEarly++;
+                    else
+                        pData->zcPred.diagWinOutLate++;
+                }
+
+                /* Predictor update weighting based on zone.
+                 * Set a flag that RecordZcTiming checks before
+                 * updating predZcOffsetHR. */
+                if (inRed)
+                {
+                    /* RED: disarm gate but DON'T touch handoffPending
+                     * or predictiveMode. The handoff race is too tight
+                     * to allow RED events to cancel pending entries. */
+                    pData->zcPred.gateActive = false;
+                    pData->zcPred.gateArmCount = 0;
+                    pData->zcPred.diagWindowReject++;
+                    pData->zcPred.deltaOkCount = 0;
+                    /* RED zone disarms gate but does NOT exit predictive
+                     * mode. Predictive exits are only via missCount > 4
+                     * (no ZC corrections) or timeout (genuine desync).
+                     * RED during predictive is expected at handoff when
+                     * phase shifts — the predictor needs time to adapt. */
+                    if (pData->zcPred.predictiveMode)
+                        pData->zcPred.diagPredExitRed++;  /* count but don't exit */
+                }
+                else if (inYellow)
+                {
+                    /* YELLOW: accept, count warning, reduce confidence */
+                    pData->zcPred.gateRevRejects++;
+                    pData->zcPred.diagWinCandOutGated++;
+                }
+                /* GREEN: normal — predictor update proceeds in RecordZcTiming */
+
+                /* gateActive hysteresis (Option C: stability-based):
+                 * Arm after 12 consecutive locked+GREEN ZCs.
+                 * Disarm on RED or timeout (timeout handled elsewhere).
+                 * Disarm on 2+ YELLOW in one revolution. */
+                if (pData->zcPred.locked && inGreen)
+                {
+                    if (pData->zcPred.gateArmCount < 255)
+                        pData->zcPred.gateArmCount++;
+                    if (pData->zcPred.gateArmCount >= 12 &&
+                        !pData->zcPred.gateActive)
+                        pData->zcPred.gateActive = true;
+                }
+                else if (!inGreen)
+                {
+                    pData->zcPred.gateArmCount = 0;
+                }
+            }
+
+            if (accept)
+            {
+                pData->bemf.zeroCrossDetected = true;
+                RecordZcTiming(pData, tsT1, tsHR);
+
+                if (pData->bemf.zeroCrossDetected)
+                {
+                    pData->icZc.diagAccepted++;
+                    pData->icZc.phase = IC_ZC_DONE;
+                    return true;
+                }
+                /* RecordZcTiming rejected (too-short interval) — reset */
+                pData->icZc.pollFilter = 0;
+                pData->icZc.rawCoro = 0;
+                pData->icZc.hasFirstClcMatch = false;
+                pData->icZc.hasRawFirstMatch = false;
+            }
         }
     }
     else
     {
-        /* Mismatch — bounce-tolerant decrement instead of hard reset.
-         * A single noise spike costs 2 polls (one lost + one to recover)
-         * instead of throwing away the entire filter. Critical at Tp:5
-         * where only ~20 polls are available after blanking. */
+        /* CLC mismatch — reset entire candidate state.
+         * Bounce-tolerant decrement for pollFilter, but raw corroboration,
+         * raw stability, and first-match are candidate-local so they reset. */
         if (pData->icZc.pollFilter > 0)
             pData->icZc.pollFilter--;
+        pData->icZc.rawCoro = 0;
+        pData->icZc.hasFirstClcMatch = false;
+        pData->icZc.hasRawFirstMatch = false;
     }
 
     return false;
 }
 
 #endif /* FEATURE_IC_ZC */
+
+#endif /* !FEATURE_V4_SECTOR_PI */

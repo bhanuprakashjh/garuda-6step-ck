@@ -46,6 +46,10 @@ typedef enum {
     GSP_CMD_TELEM_STOP      = 0x15,
     GSP_CMD_GET_PARAM_LIST  = 0x16,
     GSP_CMD_LOAD_PROFILE    = 0x17,
+    /* DMA burst capture research tool */
+    GSP_CMD_BURST_ARM       = 0x20,   /* arm the burst; no payload */
+    GSP_CMD_BURST_STATUS    = 0x21,   /* response: {state, count} 2 bytes */
+    GSP_CMD_BURST_GET_STEP  = 0x22,   /* payload: {stepIdx}; response: DMA_BURST_STEP_T */
     GSP_CMD_TELEM_FRAME     = 0x80,
     GSP_CMD_ERROR           = 0xFF
 } GSP_CMD_ID_T;
@@ -151,6 +155,130 @@ typedef struct __attribute__((packed)) {
     /* Raw comparator edge trace (24B) */
     uint16_t stepFlips[6];      /* comparator transitions per step (glitch count) */
     uint16_t stepPolls[6];      /* total polls per step */
+
+    /* Raw corroboration & IC age diagnostics (6B) */
+    uint16_t rawVetoCount;      /* CLC matched but raw didn't corroborate */
+    uint16_t icAgeRejectCount;  /* IC timestamp discarded as stale */
+    uint16_t trackFallbackCount; /* ZCs accepted via PWM-aged FL=2 fallback */
+
+    /* Phase 2: raw stability & timestamp source diagnostics (14B) */
+    uint16_t rawStableBlock;    /* Fast accept blocked: raw not stable enough */
+    uint16_t tsFromIc;          /* ZCs using IC timestamp */
+    uint16_t tsFromRaw;         /* ZCs using raw first-match timestamp */
+    uint16_t tsFromClc;         /* ZCs using CLC first-match timestamp */
+    uint16_t tsFromPoll;        /* ZCs using poll timestamp */
+    uint16_t icLeadReject;      /* IC timestamp downgraded (IC led raw too much) */
+
+    /* Scheduler margin diagnostics (4B) */
+    uint16_t targetPastCount;   /* Commutation target already in past */
+    int16_t  schedMarginHR;     /* Last scheduler margin (HR ticks, neg=late) */
+
+    /* PLL predictor telemetry (18B) */
+    int16_t  predPhaseErrHR;    /* Phase error model A: nominal (comm+half+adv) */
+    int16_t  predPhaseErrRxHR;  /* Phase error model B: reactive (comm+lastDelay) */
+    uint16_t predStepHR;        /* Predicted step period */
+    uint16_t predZcInWindow;    /* ZC fell within scan window */
+    uint16_t predZcOutWindow;   /* ZC fell outside scan window */
+    uint8_t  predLocked;        /* Predictor locked (tracking) */
+    uint8_t  predMissCount;     /* Steps without ZC correction */
+    int16_t  predMinMarginHR;   /* Min predictor margin observed */
+    uint16_t predRealZcDelayHR; /* Last measured comm-to-ZC delay */
+    uint16_t predZcOffsetHR;    /* Adaptive phase offset (IIR-tracked) */
+
+    /* Gate readiness removed — 14B reclaimed for sector PI sync.
+     * Old fields (winCandInGated, winCandOutGated, winOutEarly,
+     * winOutLate, gateActive, windowReject, windowRecovered)
+     * were old predictor supervision. */
+
+    /* Step 3: predictive scheduling (12B) */
+    uint16_t predCommOwned;     /* Commutations scheduled by predictor */
+    uint8_t  predictiveMode;    /* Predictor owns scheduling */
+    uint8_t  handoffPending;    /* Handoff in progress */
+    uint16_t predExitMiss;      /* Exits: missCount */
+    uint16_t predExitTimeout;   /* Exits: timeout */
+    uint16_t predEnter;         /* Successful predictive entries */
+    uint16_t predEntryLate;     /* Handoff aborted: target past */
+    int16_t  predVsReactiveDelta; /* Shadow: pred target - reactive target */
+    uint8_t  deltaOkCount;      /* Consecutive small-delta steps */
+    uint8_t  entryScore;        /* Predictive entry readiness (0-255) */
+    uint16_t predIsrFired;      /* ISR entries while predictiveMode active */
+    uint16_t predIsrEntries;    /* Total ISR entries with deadlineActive */
+
+    /* DPLL state (FEATURE_6STEP_DPLL) */
+    int16_t  dpllPhaseBiasHR;  /* B_hat: combined measurement/phase bias */
+    int16_t  dpllErrHR;       /* Last DPLL phase error (tMeas - predZc) */
+    uint16_t dmaMeasUsed;     /* Steps where DMA passed plausibility gate */
+    uint16_t dmaMeasReject;   /* Steps where DMA failed gate → poll used */
+    uint16_t predCloseAgree;  /* Predicted-close matched poll-close */
+    uint16_t predCloseDisagree; /* Predicted-close differed from poll-close */
+    uint8_t  dpllFallbackReason; /* Why predictive mode exited (0=none) */
+    uint8_t  measSource;       /* What fed DPLL this step: 0=none 1=poll 2=DMA */
+
+    /* Sector PI synchronizer telemetry (14B) */
+    int16_t  syncErrHR;       /* Phase error: capValue - setValue */
+    uint16_t syncT_hatHR;     /* Current sector period estimate */
+    int16_t  syncVsReactive;  /* nextComm(sync) - targetHR(reactive) */
+    uint8_t  syncMode;        /* 0=OFF, 1=SHADOW, 2=OWNED */
+    uint8_t  syncGoodStreak;  /* Consecutive small-error sectors */
+    uint8_t  syncMissStreak;  /* Consecutive missed DMA clusters */
+    uint8_t  syncClusterCount;/* Edges in last selected cluster */
+    uint16_t syncAccepts;     /* Total sectors with valid DMA measurement */
+    uint16_t syncMisses;      /* Total sectors with no DMA measurement */
+
+    /* IC capture diagnostics (2B) — added to debug high-speed wall.
+     * icBounce climbs when the SCCP2 IC capture is rejected by the
+     * 50% interval gate in _CCP2Interrupt — i.e. the IC fired before
+     * (estimated step / 2) elapsed since the last ZC. During
+     * acceleration the IIR-averaged refIntervalHR lags reality, so
+     * the actual ZC arrives at the *real* 50% mark which is BEFORE
+     * the gate's threshold, and the IC capture is silently dropped. */
+    uint16_t icBounce;
+
+    /* DMA shadow telemetry (26B) — dual-CCP + DMA ring experiment.
+     * Only populated when FEATURE_IC_DMA_SHADOW=1 at compile time,
+     * otherwise all zero. Fields describe how well a shadow-only
+     * hardware-precise capture ring (CCP2+DMA0 for rising ZCs,
+     * CCP5+DMA1 for falling) tracks the live poll-accepted ZC.
+     *
+     * 32-bit counters grouped at the front — at 60k eRPM the original
+     * uint16 step/match counters wrapped in ~13 seconds and caused
+     * display garbage in the telemetry. The per-step average
+     * (dmaEdgesAvgX16) stays 16-bit — it never accumulates. */
+    uint32_t dmaStepCount;            /* probe invocations (total steps observed) */
+    uint32_t dmaMatchCount;           /* steps where DMA found capture in window */
+    uint32_t dmaRingOverflow;         /* ring near-full events */
+    uint16_t dmaEdgesAvgX16;          /* avg captures/step × 16 (fixed-point) */
+    int16_t  dmaLastEarliestVsPoll;   /* DMA earliest vs poll-accepted (HR ticks) */
+    int16_t  dmaLastEarliestVsExp;    /* DMA earliest vs predicted ZC */
+    int16_t  dmaLastClosestVsExp;     /* DMA best-fit vs predicted ZC */
+    int16_t  dmaLastPollVsExp;        /* baseline: poll-accepted vs predicted ZC */
+    uint8_t  dmaLastEdgeCount;        /* captures found in most recent step */
+    uint8_t  dmaLastFound;            /* 1 = most recent probe matched */
+
+    /* Hybrid DMA-direct ZC substitution telemetry. Populated when
+     * FEATURE_DMA_ZC_DIRECT=1. Shows how often the poll timestamp was
+     * replaced with a hardware-precise DMA edge, plus the observed
+     * correction range (how much earlier the real edge was vs poll). */
+    uint32_t dmaSubCount;             /* total DMA→direct substitutions */
+    uint32_t dmaSubSkipGated;         /* below speed threshold, skipped */
+    uint32_t dmaSubSkipRange;         /* DMA edge out of sanity window */
+    int16_t  dmaLastCorrectionHR;     /* most recent (refined - poll) HR delta */
+    int16_t  dmaMinCorrectionHR;      /* min (most negative) correction seen */
+    int16_t  dmaMaxCorrectionHR;      /* max (most positive) correction seen */
+
+    /* Phase-current peak tracking (added 2026-04-21 for kickback validation).
+     * Rolling window peaks reset on snapshot read. At-fault fields frozen
+     * when any BOARD_* fault transitions; remain until motor restart.
+     * All in raw ADC units — same scale as iaRaw/ibRaw. */
+    int16_t  iaPkMax,   iaPkMin;
+    int16_t  ibPkMax,   ibPkMin;
+    int16_t  ibusPkMax, ibusPkMin;
+    int16_t  iaAtFaultMax,   iaAtFaultMin;
+    int16_t  ibAtFaultMax,   ibAtFaultMin;
+    int16_t  ibusAtFaultMax, ibusAtFaultMin;
+    int16_t  iaAtFaultInst, ibAtFaultInst, ibusAtFaultInst;
+    uint8_t  faultSnapshotValid;
+    uint8_t  _padPeaks;               /* align to 2 bytes */
 } GSP_CK_SNAPSHOT_T;
 
 /* XC16 doesn't support _Static_assert. Verify size at compile time:

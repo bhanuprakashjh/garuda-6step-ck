@@ -8,7 +8,7 @@
 
 #include "../garuda_config.h"
 
-#if FEATURE_GSP
+#if FEATURE_GSP && !FEATURE_V4_SECTOR_PI
 
 #include <string.h>
 #include "gsp_snapshot.h"
@@ -36,6 +36,35 @@ void GSP_CaptureSnapshot(GSP_CK_SNAPSHOT_T *dst)
     dst->ibRaw       = src->ibRaw;
     dst->ibusRaw     = src->ibusRaw;
     dst->duty        = (uint16_t)src->duty;
+
+    /* Phase-current peaks: copy rolling window, reset src so next
+     * window starts fresh. Signed max/min are tracked separately so
+     * the GUI can distinguish positive vs negative direction transients.
+     *
+     * At-fault fields preserved — cleared on motor restart, not on
+     * snapshot read. Until then any repeated snapshot will show the
+     * same trip values so the operator can read them after the event. */
+    dst->iaPkMax    = src->iaPkMax;
+    dst->iaPkMin    = src->iaPkMin;
+    dst->ibPkMax    = src->ibPkMax;
+    dst->ibPkMin    = src->ibPkMin;
+    dst->ibusPkMax  = src->ibusPkMax;
+    dst->ibusPkMin  = src->ibusPkMin;
+    dst->iaAtFaultMax   = src->iaAtFaultMax;
+    dst->iaAtFaultMin   = src->iaAtFaultMin;
+    dst->ibAtFaultMax   = src->ibAtFaultMax;
+    dst->ibAtFaultMin   = src->ibAtFaultMin;
+    dst->ibusAtFaultMax = src->ibusAtFaultMax;
+    dst->ibusAtFaultMin = src->ibusAtFaultMin;
+    dst->iaAtFaultInst   = src->iaAtFaultInst;
+    dst->ibAtFaultInst   = src->ibAtFaultInst;
+    dst->ibusAtFaultInst = src->ibusAtFaultInst;
+    dst->faultSnapshotValid = src->faultSnapshotValid;
+    dst->_padPeaks = 0;
+    /* Reset rolling peaks for next 20 ms window */
+    src->iaPkMax   = src->iaPkMin   = src->iaRaw;
+    src->ibPkMax   = src->ibPkMin   = src->ibRaw;
+    src->ibusPkMax = src->ibusPkMin = src->ibusRaw;
 
     /* Speed/timing */
     dst->stepPeriod   = src->timing.stepPeriod;
@@ -116,6 +145,158 @@ void GSP_CaptureSnapshot(GSP_CK_SNAPSHOT_T *dst)
             dst->stepPolls[i] = src->icZc.stepPolls[i];
         }
     }
+
+    /* Raw corroboration & IC age diagnostics */
+    dst->rawVetoCount      = src->icZc.diagRawVeto;
+    dst->icAgeRejectCount  = src->icZc.diagIcAgeReject;
+    dst->trackFallbackCount = src->icZc.diagTrackFallback;
+
+    /* Phase 2: raw stability & timestamp source */
+    dst->rawStableBlock    = src->icZc.diagRawStableBlock;
+    dst->tsFromIc          = src->icZc.diagTsFromIc;
+    dst->tsFromRaw         = src->icZc.diagTsFromRaw;
+    dst->tsFromClc         = src->icZc.diagTsFromClc;
+    dst->tsFromPoll        = src->icZc.diagTsFromPoll;
+    dst->icLeadReject      = src->icZc.diagIcLeadReject;
+
+    /* Scheduler margin */
+    dst->targetPastCount   = src->zcDiag.diagTargetPast;
+    dst->schedMarginHR     = src->zcDiag.lastScheduleMarginHR;
+
+    /* PLL predictor telemetry */
+    dst->predPhaseErrHR    = src->zcPred.phaseErrHR;
+    dst->predPhaseErrRxHR  = src->zcPred.phaseErrReactiveHR;
+    dst->predStepHR        = src->zcPred.predStepHR;
+    dst->predZcInWindow    = src->zcPred.diagZcInWindow;
+    dst->predZcOutWindow   = src->zcPred.diagZcOutWindow;
+    dst->predLocked        = src->zcPred.locked ? 1 : 0;
+    dst->predMissCount     = src->zcPred.missCount;
+    dst->predMinMarginHR   = src->zcPred.diagMinMarginHR;
+    dst->predRealZcDelayHR = src->zcPred.lastRealZcDelayHR;
+    dst->predZcOffsetHR    = src->zcPred.predZcOffsetHR;
+
+    /* Gate readiness fields removed — reclaimed for sector PI */
+
+    /* Step 3: predictive scheduling */
+    dst->predCommOwned     = src->zcPred.diagPredCommOwned;
+    dst->predictiveMode    = src->zcPred.predictiveMode ? 1 : 0;
+    dst->handoffPending    = src->zcPred.handoffPending ? 1 : 0;
+    dst->predExitMiss      = src->zcPred.diagPredExitMiss;
+    dst->predExitTimeout   = src->zcPred.diagPredExitTimeout;
+    dst->predEnter         = src->zcPred.diagPredEnter;
+    dst->predEntryLate     = src->zcPred.diagPredEntryLate;
+    dst->predVsReactiveDelta = src->zcPred.predVsReactiveDelta;
+    dst->deltaOkCount      = src->zcPred.deltaOkCount;
+    dst->entryScore        = src->zcPred.entryScore;
+    dst->predIsrFired      = src->zcPred.diagPredIsrFired;
+    dst->predIsrEntries    = src->zcPred.diagPredIsrEntries;
+
+    /* DPLL state */
+#if FEATURE_6STEP_DPLL
+    dst->dpllPhaseBiasHR    = src->zcPred.phaseBiasHR;
+    dst->dpllErrHR          = src->zcPred.dpllErrHR;
+    dst->dmaMeasUsed        = src->zcPred.dmaMeasUsedCount;
+    dst->dmaMeasReject      = src->zcPred.dmaMeasRejectCount;
+    dst->predCloseAgree     = src->zcPred.predCloseAgreeCount;
+    dst->predCloseDisagree  = src->zcPred.predCloseDisagreeCount;
+    dst->dpllFallbackReason = src->zcPred.fallbackReason;
+#else
+    dst->dpllPhaseBiasHR    = 0;
+    dst->dpllErrHR          = 0;
+    dst->dmaMeasUsed        = 0;
+    dst->dmaMeasReject      = 0;
+    dst->predCloseAgree     = 0;
+    dst->predCloseDisagree  = 0;
+    dst->dpllFallbackReason = 0;
+#endif
+
+#if FEATURE_IC_DMA_SHADOW
+    dst->measSource         = src->dmaShadow.measSource;
+#else
+    dst->measSource         = 0;
+#endif
+
+    /* Sector PI synchronizer telemetry */
+#if FEATURE_SECTOR_PI
+    dst->syncErrHR          = src->zcSync.syncErrHR;
+    dst->syncT_hatHR        = src->zcSync.T_hatHR;
+    dst->syncVsReactive     = (int16_t)src->zcSync.capValueHR;  /* DEBUG: repurposed for capValueHR */
+    dst->syncMode           = src->zcSync.mode;
+    dst->syncGoodStreak     = src->zcSync.goodStreak;
+    dst->syncMissStreak     = src->zcSync.missStreak;
+    dst->syncClusterCount   = src->zcSync.clusterCount;
+    dst->syncAccepts        = src->zcSync.diagSyncAccepts;
+    dst->syncMisses         = src->zcSync.diagSyncMisses;
+#else
+    dst->syncErrHR          = 0;
+    dst->syncT_hatHR        = 0;
+    dst->syncVsReactive     = 0;
+    dst->syncMode           = 0;
+    dst->syncGoodStreak     = 0;
+    dst->syncMissStreak     = 0;
+    dst->syncClusterCount   = 0;
+    dst->syncAccepts        = 0;
+    dst->syncMisses         = 0;
+#endif
+
+    /* IC bounce: SCCP2 captures rejected by the 50% interval gate.
+     * Gated on FEATURE_IC_ZC_CAPTURE because the field only exists
+     * in that configuration. When FEATURE_IC_DMA_SHADOW takes over
+     * CCP2 exclusively, diagIcBounce is replaced by DMA shadow
+     * telemetry. */
+#if FEATURE_IC_ZC_CAPTURE
+    dst->icBounce          = src->icZc.diagIcBounce;
+#else
+    dst->icBounce          = 0;
+#endif
+
+    /* DMA shadow telemetry */
+#if FEATURE_IC_DMA_SHADOW
+    dst->dmaStepCount          = src->dmaShadow.stepCount;
+    dst->dmaMatchCount         = src->dmaShadow.matchCount;
+    dst->dmaRingOverflow       = src->dmaShadow.ringOverflowCount;
+    /* edges × 16 / stepCount, saturated at uint16 max */
+    if (src->dmaShadow.stepCount > 0) {
+        uint32_t avgX16 =
+            (src->dmaShadow.edgesInWindowSum * 16UL)
+            / src->dmaShadow.stepCount;
+        dst->dmaEdgesAvgX16 =
+            (avgX16 > 0xFFFFUL) ? 0xFFFFU : (uint16_t)avgX16;
+    } else {
+        dst->dmaEdgesAvgX16 = 0;
+    }
+    dst->dmaLastEarliestVsPoll = src->dmaShadow.lastEarliestVsPoll;
+    dst->dmaLastEarliestVsExp  = src->dmaShadow.lastEarliestVsExpected;
+    dst->dmaLastClosestVsExp   = src->dmaShadow.lastClosestVsExpected;
+    dst->dmaLastPollVsExp      = src->dmaShadow.lastPollVsExpected;
+    dst->dmaLastEdgeCount      = src->dmaShadow.lastEdgeCount;
+    dst->dmaLastFound          = src->dmaShadow.lastFound ? 1u : 0u;
+
+    /* DMA-direct substitution telemetry */
+    dst->dmaSubCount          = src->dmaShadow.substituteCount;
+    dst->dmaSubSkipGated      = src->dmaShadow.substituteSkipGated;
+    dst->dmaSubSkipRange      = src->dmaShadow.substituteSkipRange;
+    dst->dmaLastCorrectionHR  = src->dmaShadow.lastCorrectionHR;
+    dst->dmaMinCorrectionHR   = src->dmaShadow.minCorrectionHR;
+    dst->dmaMaxCorrectionHR   = src->dmaShadow.maxCorrectionHR;
+#else
+    dst->dmaStepCount          = 0;
+    dst->dmaMatchCount         = 0;
+    dst->dmaRingOverflow       = 0;
+    dst->dmaEdgesAvgX16        = 0;
+    dst->dmaLastEarliestVsPoll = 0;
+    dst->dmaLastEarliestVsExp  = 0;
+    dst->dmaLastClosestVsExp   = 0;
+    dst->dmaLastPollVsExp      = 0;
+    dst->dmaLastEdgeCount      = 0;
+    dst->dmaLastFound          = 0;
+    dst->dmaSubCount           = 0;
+    dst->dmaSubSkipGated       = 0;
+    dst->dmaSubSkipRange       = 0;
+    dst->dmaLastCorrectionHR   = 0;
+    dst->dmaMinCorrectionHR    = 0;
+    dst->dmaMaxCorrectionHR    = 0;
+#endif
 #endif
 }
 

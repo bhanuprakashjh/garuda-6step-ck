@@ -24,7 +24,7 @@ CLEAN_SUBPROJECTS=${CLEAN_SUBPROJECTS_${SUBPROJECTS}}
 
 
 # Project Name
-PROJECTNAME=garuda-6step-ck-clean
+PROJECTNAME=garuda_6step_ck.X
 
 # Active Configuration
 DEFAULTCONF=default
