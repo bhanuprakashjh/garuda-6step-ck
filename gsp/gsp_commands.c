@@ -21,6 +21,7 @@
 #include "gsp_ck_params.h"
 #include "../garuda_types.h"
 #include "../garuda_service.h"
+#include "../motor/v4_params.h"   /* v4Params for buildHash fold */
 
 /* ── Telemetry streaming state ──────────────────────────────────── */
 
@@ -91,6 +92,25 @@ static void HandleGetInfo(const uint8_t *payload, uint8_t payloadLen)
     info.featureFlags    = BuildFeatureFlags();
     info.pwmFrequency    = PWMFREQUENCY_HZ;
     info.maxErpm         = ckParams.maxClosedLoopErpm;
+
+    /* Build hash: djb2 of __DATE__ " " __TIME__ folded with key V4
+     * tunables.  Updates every recompile AND every time a tunable
+     * changes — host can verify "is the firmware I expect actually
+     * on the chip?" by comparing the printed hash. */
+    {
+        static const char buildStamp[] = __DATE__ " " __TIME__;
+        uint32_t hash = 5381UL;
+        for (const char *p = buildStamp; *p; p++) {
+            hash = ((hash << 5) + hash) ^ (uint32_t)(uint8_t)*p;
+        }
+        /* Fold V4 tunables so any GUI param tweak shifts the hash too. */
+        hash ^= (uint32_t)v4Params.phaseAdvanceDegX10;
+        hash ^= ((uint32_t)v4Params.blankingPct) << 8;
+        hash ^= ((uint32_t)v4Params.piKpShift)   << 16;
+        hash ^= ((uint32_t)v4Params.piKiShift)   << 20;
+        hash ^= ((uint32_t)v4Params.minPeriodHr) << 0;
+        info.buildHash = hash;
+    }
 
     GSP_SendResponse(GSP_CMD_GET_INFO, (const uint8_t *)&info, sizeof(info));
 }
@@ -726,9 +746,20 @@ void GSP_TelemTick(void)
     d[3] = 0;                                /* ataStatus */
     d[4] = (uint8_t)(gV4PotRaw & 0xFF);     /* potRaw L */
     d[5] = (uint8_t)(gV4PotRaw >> 8);       /* potRaw H */
+    /* Duty% from the value the hardware actually wrote, not the upstream
+     * commanded amplitude. g_pwmActualDuty is the post-clamp PG[123]DC
+     * value and g_pwmPer is its denominator (LOOPTIME_TCY in normal mode,
+     * sector-period in SP). Was previously `actualAmplitude * 100 / 32768`
+     * which always showed 99% even when the per-200 (now per-100) clamp
+     * pinned the gates at ~94-97%. */
+    extern volatile uint16_t g_pwmActualDuty;
+    extern volatile uint16_t g_pwmPer;
+    extern volatile bool     g_blockCommActive;
     uint8_t dutyPct = 0;
-    if (t.actualAmplitude > 0)
-        dutyPct = (uint8_t)((uint32_t)t.actualAmplitude * 100 / 32768);
+    if (g_blockCommActive)
+        dutyPct = 100;                          /* override path → solid ON */
+    else if (g_pwmPer > 0U && t.actualAmplitude > 0U)
+        dutyPct = (uint8_t)((uint32_t)g_pwmActualDuty * 100UL / g_pwmPer);
     d[6] = dutyPct;                          /* dutyPct */
     d[7] = t.commandEnabled ? 1 : 0;        /* zcSynced (repurpose as PI active) */
 
@@ -776,7 +807,7 @@ void GSP_TelemTick(void)
      * 2 = request latched but SP not yet applied (boundary lag / error)
      * 3 = SP active and requested
      * 1 = stale/impossible active state */
-    d[37] = (t.spMode ? 1U : 0U) | (t.spRequest ? 2U : 0U);
+    d[37] = (t.spMode ? 1U : 0U) | (t.spRequest ? 2U : 0U) | (g_blockCommActive ? 4U : 0U);
     { uint16_t erpm16 = (t.erpmNow > 0xFFFF) ? 0xFFFF : (uint16_t)t.erpmNow;
       memcpy(&d[38], &erpm16, 2); }          /* erpmNow from timerPeriod */
 

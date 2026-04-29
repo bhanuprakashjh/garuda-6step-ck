@@ -24,6 +24,12 @@
  * during the long OFF portion of an SP frame decelerates the motor. */
 extern volatile bool v4_spActive;
 
+/* Last duty written to PG[123]DC AFTER clamping. Telemetry reads this. */
+volatile uint16_t g_pwmActualDuty = 0;
+
+/* Block-commutation flag — see hal_pwm.h. */
+volatile bool g_blockCommActive = false;
+
 /* Override data bits: [11:10] = OVRDAT, bit11=H, bit10=L
  *                     [13]    = OVRENH, [12] = OVRENL
  *
@@ -43,6 +49,20 @@ static inline void ApplyPhaseState(volatile uint16_t *ioconl,
     switch (state)
     {
         case PHASE_PWM_ACTIVE:
+            if (g_blockCommActive)
+            {
+                /* Block commutation: H solid ON, L solid OFF.
+                 * No PWM chopping during the active sector.
+                 *   OVRDAT_H = 1 → POL=active-low inverts → ATA6847 HS pin
+                 *                 driven LOW → HS FET ON
+                 *   OVRDAT_L = 0 → no invert → ATA6847 LS pin LOW → LS FET OFF
+                 * Activated via duty-saturation hysteresis in sector_pi.c
+                 * TimeTick. Float phase BEMF stays clean (no switching),
+                 * so the existing ADC-midpoint capture path keeps working. */
+                val |= 0x3000u;                            /* OVRENH=1, OVRENL=1 */
+                val = (val & ~0x0400u) | 0x0800u;          /* OVRDAT = 10 (H=1, L=0) */
+                break;
+            }
 #if PWM_DRIVE_UNIPOLAR
             /* H-PWM / L-OFF (unipolar). 34x fewer ZC timeouts vs
              * complementary — half the switching edges = clean comparator.
@@ -135,7 +155,12 @@ void HAL_PWM_Init(void)
     PG1DCA = 0x00;
     PG1PER = 0x10;
     PG1TRIGA = 0x00;        /* Trigger at center (for current ADC) */
-    PG1TRIGB = 0x00;
+    PG1TRIGB = 0x00;        /* 2x-ADC experiment (PG1TRIGB=200) on
+                             * 2026-04-29 produced no peak-eRPM gain at
+                             * 50 kHz PWM (220k → 220k), ruling out sample
+                             * rate as the limit. Reverted to single trigger;
+                             * the 60 kHz vs 50 kHz peak gap (228k vs 220k)
+                             * is current-ripple / float-phase cleanliness. */
     PG1TRIGC = 0x00;
     PG1DTL = DEADTIME_TCY;
     PG1DTH = DEADTIME_TCY;
@@ -210,6 +235,7 @@ void HAL_PWM_SetDutyCycle(uint32_t duty)
     PG2DC = (uint16_t)duty;
     PG3DC = (uint16_t)duty;
     PG1DC = (uint16_t)duty;
+    g_pwmActualDuty = (uint16_t)duty;
 
 #if FEATURE_PTG_ZC
     /* Track switching edge for PTG edge-relative sampling.
@@ -231,13 +257,19 @@ void HAL_PWM_SetDutyCycle(uint32_t duty)
  * so behavior matches HAL_PWM_SetDutyCycle (per-200 ≈ MAX_DUTY). */
 void HAL_PWM_SetDutyCyclePeriod(uint32_t duty, uint16_t per)
 {
-    uint32_t maxD = (per > 200U) ? (uint32_t)(per - 200U) : (uint32_t)per;
+    /* MIN_OFF reduced from 200 → 100 ticks (1µs → 500ns) on 2026-04-29.
+     * ATA6847 has charge pumps (datasheet: "100% PWM Duty Cycle Control"),
+     * so bootstrap-refresh argument for the 200-tick clamp doesn't apply.
+     * 100 ticks gives ~97% effective duty at 60kHz, leaving headroom for
+     * adaptive deadtime + CCPT during H↔L transitions when below 100%. */
+    uint32_t maxD = (per > 100U) ? (uint32_t)(per - 100U) : (uint32_t)per;
     if (duty > maxD) duty = maxD;
     if (duty < MIN_DUTY) duty = MIN_DUTY;
 
     PG2DC = (uint16_t)duty;
     PG3DC = (uint16_t)duty;
     PG1DC = (uint16_t)duty;
+    g_pwmActualDuty = (uint16_t)duty;
 
     PG1STATbits.UPDREQ = 1;
     PG2STATbits.UPDREQ = 1;

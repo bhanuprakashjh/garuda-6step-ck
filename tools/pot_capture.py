@@ -67,6 +67,8 @@ def parse_packet(buf):
         crc_recv = (buf[2 + pkt_len] << 8) | buf[2 + pkt_len + 1]
         crc_calc = crc16(body)
         if crc_recv != crc_calc:
+            import sys
+            print(f"  [CRC FAIL] len={pkt_len} cmd=0x{buf[2]:02x} recv=0x{crc_recv:04x} calc=0x{crc_calc:04x}", file=sys.stderr)
             buf = buf[1:]
             continue
         cmd = buf[2]
@@ -99,36 +101,105 @@ def decode_ck_snapshot(data):
     s['icAccepted'] = struct.unpack_from('<H', data, 32)[0]
     s['icFalse'] = struct.unpack_from('<H', data, 34)[0]
     s['filterLevel'] = data[36]
-    s['missed'] = data[37]
-    s['forced'] = data[38]
-    s['ilimActive'] = data[39] != 0
+    sp_bits = data[37]              # V4: bit0=SP active, bit1=SP requested, bit2=block-comm
+    s['spBits'] = sp_bits
+    s['spMode'] = sp_bits & 0x01
+    s['spRequest'] = (sp_bits >> 1) & 0x01
+    s['blockComm'] = (sp_bits >> 2) & 0x01
+    s['erpmTP'] = struct.unpack_from('<H', data, 38)[0]  # V4: eRPM from timerPeriod
+    # s['ilimActive'] = data[39] != 0  # overwritten by erpmTP high byte
     s['systemTick'] = struct.unpack_from('<I', data, 40)[0]
     s['uptime'] = struct.unpack_from('<I', data, 44)[0]
-    if len(data) >= 52:
-        s['zcLatencyPct'] = data[48]
-        s['zcBlankPct'] = data[49]
-        s['zcBypassCount'] = struct.unpack_from('<H', data, 50)[0]
-    else:
-        s['zcLatencyPct'] = 0
-        s['zcBlankPct'] = 0
-        s['zcBypassCount'] = 0
-    # V3 ZC diagnostics
+    # Slots 48-63 carry V4 capture-rate diagnostics (overlay over V3
+    # zcLatency/zcBlank/zcMode/etc. fields which V4 doesn't populate).
+    # 4 × uint32 — firmware upgraded from uint16 because ADC fires at
+    # 40 kHz and uint16 wraps every ~1.6 s.
+    # Slot 60 was adcAlreadySet, now adcSetRising (polarity split).
     if len(data) >= 64:
-        s['zcMode'] = data[52]
-        s['actualForcedComm'] = data[53]
-        s['zcTimeoutCount'] = struct.unpack_from('<H', data, 54)[0]
-        s['risingZcCount'] = struct.unpack_from('<H', data, 56)[0]
-        s['fallingZcCount'] = struct.unpack_from('<H', data, 58)[0]
-        s['risingTimeouts'] = struct.unpack_from('<H', data, 60)[0]
-        s['fallingTimeouts'] = struct.unpack_from('<H', data, 62)[0]
+        s['adcBlankReject']     = struct.unpack_from('<I', data, 48)[0]
+        s['adcStateMismatch']   = struct.unpack_from('<I', data, 52)[0]
+        s['adcCaptureSet']      = struct.unpack_from('<I', data, 56)[0]
+        s['adcSetRising']       = struct.unpack_from('<I', data, 60)[0]
     else:
-        s['zcMode'] = 0
-        s['actualForcedComm'] = 0
-        s['zcTimeoutCount'] = 0
-        s['risingZcCount'] = 0
-        s['fallingZcCount'] = 0
-        s['risingTimeouts'] = 0
-        s['fallingTimeouts'] = 0
+        s['adcBlankReject'] = 0
+        s['adcStateMismatch'] = 0
+        s['adcCaptureSet'] = 0
+        s['adcSetRising'] = 0
+    # OFF-mid falling ZC diagnostic (SCCP1 ISR at PWM peak)
+    if len(data) >= 72:
+        s['offMidCapture']  = struct.unpack_from('<I', data, 64)[0]
+        s['offMidMismatch'] = struct.unpack_from('<I', data, 68)[0]
+    else:
+        s['offMidCapture'] = 0
+        s['offMidMismatch'] = 0
+    # V5.0 PTG: _PTG0Interrupt fire count.
+    # Expected: ~40 kHz × CL duration when FEATURE_V5_PTG_ZC=1.
+    # 0 when flag=0 (PTG never starts).
+    if len(data) >= 76:
+        s['ptgFires'] = struct.unpack_from('<I', data, 72)[0]
+    else:
+        s['ptgFires'] = 0
+    # V5.0 per-polarity shadow counters. The key diagnostic is pAcc%
+    # (falling accept / (falling accept+reject)). Target ≈ 50 if PTG
+    # actually catches falling ZCs; 0 means the peak-sample moment
+    # doesn't see a falling-ZC transition.
+    if len(data) >= 92:
+        s['ptgRisingAcc']  = struct.unpack_from('<I', data, 76)[0]
+        s['ptgRisingRej']  = struct.unpack_from('<I', data, 80)[0]
+        s['ptgFallingAcc'] = struct.unpack_from('<I', data, 84)[0]
+        s['ptgFallingRej'] = struct.unpack_from('<I', data, 88)[0]
+    else:
+        s['ptgRisingAcc']  = 0
+        s['ptgRisingRej']  = 0
+        s['ptgFallingAcc'] = 0
+        s['ptgFallingRej'] = 0
+    # V5.1 ADC post-ZC shadow counters. Per-sample (no v4_captureValid
+    # gate) so direct comparison with V5.0 PTG pR%/pF% — they should
+    # match if the ADC ISR sees the same valley signal PTG sees.
+    if len(data) >= 108:
+        s['postZcRisingAcc']  = struct.unpack_from('<I', data, 92)[0]
+        s['postZcRisingRej']  = struct.unpack_from('<I', data, 96)[0]
+        s['postZcFallingAcc'] = struct.unpack_from('<I', data, 100)[0]
+        s['postZcFallingRej'] = struct.unpack_from('<I', data, 104)[0]
+    else:
+        s['postZcRisingAcc']  = 0
+        s['postZcRisingRej']  = 0
+        s['postZcFallingAcc'] = 0
+        s['postZcFallingRej'] = 0
+    # V5.2 measurement-based period tracker. 0 means flag off or unseeded.
+    # eTPm eRPM-equivalent = 15625000/tMeasHR. Compare to eRpm: if eTPm
+    # tracks eRpm (ratio 1.0), measurement PI works. V4 set-point PI
+    # sits at eTP ≈ eRpm/2 (wrong equilibrium).
+    if len(data) >= 110:
+        s['tMeasHR'] = struct.unpack_from('<H', data, 108)[0]
+    else:
+        s['tMeasHR'] = 0
+    # Full 32-bit sectorCount (was low-16 at offset 24; full at 110).
+    # Host computes sectorsPerSec from delta vs systemTick for an
+    # independent sanity check against firmware eRpm.
+    if len(data) >= 114:
+        s['sectorCountFull'] = struct.unpack_from('<I', data, 110)[0]
+    else:
+        s['sectorCountFull'] = 0
+    # Derive the falling-ZC share.
+    s['adcSetFalling'] = max(0, s['adcCaptureSet'] - s['adcSetRising'])
+    # adcAlreadySet no longer shipped; left zeroed for legacy code.
+    s['adcAlreadySet'] = 0
+    # Derived: Commutate-sectors where capture was missing or filter-rejected.
+    # goodZc = sectorCount low 16 (total Commutates), icAccepted = diagCaptures.
+    # (Can't use icFalse/diagPiRuns — it only counts accepted captures.)
+    s['commutateNoCapture'] = max(0, s.get('goodZc', 0) - s.get('icAccepted', 0))
+    # Legacy V3 names kept zeroed for downstream code that still reads them.
+    s['zcLatencyPct'] = 0
+    s['zcBlankPct'] = 0
+    s['zcBypassCount'] = 0
+    s['zcMode'] = 0
+    s['actualForcedComm'] = 0
+    s['zcTimeoutCount'] = 0
+    s['risingZcCount'] = 0
+    s['fallingZcCount'] = 0
+    s['risingTimeouts'] = 0
+    s['fallingTimeouts'] = 0
     # V4 per-step 0..5 counters (88 bytes total)
     if len(data) >= 88:
         for i in range(6):
@@ -149,6 +220,181 @@ def decode_ck_snapshot(data):
         for i in range(6):
             s[f'stepFlips{i}'] = 0
             s[f'stepPolls{i}'] = 0
+    # V6 raw corroboration & IC age diagnostics (118 bytes total)
+    if len(data) >= 118:
+        s['rawVetoCount'] = struct.unpack_from('<H', data, 112)[0]
+        s['icAgeRejectCount'] = struct.unpack_from('<H', data, 114)[0]
+        s['trackFallbackCount'] = struct.unpack_from('<H', data, 116)[0]
+    else:
+        s['rawVetoCount'] = 0
+        s['icAgeRejectCount'] = 0
+        s['trackFallbackCount'] = 0
+    # V7 Phase 2: raw stability & timestamp source diagnostics (130 bytes)
+    if len(data) >= 130:
+        s['rawStableBlock'] = struct.unpack_from('<H', data, 118)[0]
+        s['tsFromIc'] = struct.unpack_from('<H', data, 120)[0]
+        s['tsFromRaw'] = struct.unpack_from('<H', data, 122)[0]
+        s['tsFromClc'] = struct.unpack_from('<H', data, 124)[0]
+        s['tsFromPoll'] = struct.unpack_from('<H', data, 126)[0]
+        s['icLeadReject'] = struct.unpack_from('<H', data, 128)[0]
+    else:
+        s['rawStableBlock'] = 0
+        s['tsFromIc'] = 0
+        s['tsFromRaw'] = 0
+        s['tsFromClc'] = 0
+        s['tsFromPoll'] = 0
+        s['icLeadReject'] = 0
+    # V8 Scheduler margin diagnostics (134 bytes total)
+    if len(data) >= 134:
+        s['targetPastCount'] = struct.unpack_from('<H', data, 130)[0]
+        s['schedMarginHR'] = struct.unpack_from('<h', data, 132)[0]  # signed
+    else:
+        s['targetPastCount'] = 0
+        s['schedMarginHR'] = 0
+    # V9 PLL predictor telemetry (152 bytes)
+    if len(data) >= 152:
+        s['predPhaseErrHR'] = struct.unpack_from('<h', data, 134)[0]
+        s['predPhaseErrRxHR'] = struct.unpack_from('<h', data, 136)[0]
+        s['predStepHR'] = struct.unpack_from('<H', data, 138)[0]
+        s['predZcInWindow'] = struct.unpack_from('<H', data, 140)[0]
+        s['predZcOutWindow'] = struct.unpack_from('<H', data, 142)[0]
+        s['predLocked'] = data[144]
+        s['predMissCount'] = data[145]
+        s['predMinMarginHR'] = struct.unpack_from('<h', data, 146)[0]
+        s['predRealZcDelayHR'] = struct.unpack_from('<H', data, 148)[0]
+        s['predZcOffsetHR'] = struct.unpack_from('<H', data, 150)[0]
+    else:
+        s['predPhaseErrHR'] = 0
+        s['predPhaseErrRxHR'] = 0
+        s['predStepHR'] = 0
+        s['predZcInWindow'] = 0
+        s['predZcOutWindow'] = 0
+        s['predLocked'] = 0
+        s['predMissCount'] = 0
+        s['predMinMarginHR'] = 0
+        s['predRealZcDelayHR'] = 0
+        s['predZcOffsetHR'] = 0
+    # Gate readiness fields removed from snapshot — zero-fill for CSV compat
+    s['winCandInGated'] = 0
+    s['winCandOutGated'] = 0
+    s['winOutEarly'] = 0
+    s['winOutLate'] = 0
+    s['gateActive'] = 0
+    s['windowReject'] = 0
+    s['windowRecovered'] = 0
+    # V11 Step 3: predictive scheduling (shifted -14 by gate removal)
+    if len(data) >= 172:
+        s['predCommOwned'] = struct.unpack_from('<H', data, 152)[0]
+        s['predictiveMode'] = data[154]
+        s['handoffPending'] = data[155]
+        s['predExitMiss'] = struct.unpack_from('<H', data, 156)[0]
+        s['predExitTimeout'] = struct.unpack_from('<H', data, 158)[0]
+        s['predEnter'] = struct.unpack_from('<H', data, 160)[0]
+        s['predEntryLate'] = struct.unpack_from('<H', data, 162)[0]
+        s['predVsReactiveDelta'] = struct.unpack_from('<h', data, 164)[0]
+        s['deltaOkCount'] = data[166]
+        s['entryScore'] = data[167]
+        s['predIsrFired'] = struct.unpack_from('<H', data, 168)[0]
+        s['predIsrEntries'] = struct.unpack_from('<H', data, 170)[0]
+    else:
+        s['predCommOwned'] = 0
+        s['predictiveMode'] = 0
+        s['handoffPending'] = 0
+        s['predExitMiss'] = 0
+        s['predExitTimeout'] = 0
+        s['predVsReactiveDelta'] = 0
+        s['deltaOkCount'] = 0
+        s['entryScore'] = 0
+        s['predEnter'] = 0
+        s['predEntryLate'] = 0
+        s['predIsrFired'] = 0
+        s['predIsrEntries'] = 0
+    # V12b: DPLL state (shifted -14 by gate removal)
+    if len(data) >= 186:
+        s['dpllPhaseBiasHR'] = struct.unpack_from('<h', data, 172)[0]
+        s['dpllErrHR'] = struct.unpack_from('<h', data, 174)[0]
+        s['dmaMeasUsed'] = struct.unpack_from('<H', data, 176)[0]
+        s['dmaMeasReject'] = struct.unpack_from('<H', data, 178)[0]
+        s['predCloseAgree'] = struct.unpack_from('<H', data, 180)[0]
+        s['predCloseDisagree'] = struct.unpack_from('<H', data, 182)[0]
+        s['dpllFallbackReason'] = data[184]
+        s['measSource'] = data[185]
+    else:
+        s['dpllPhaseBiasHR'] = 0
+        s['dpllErrHR'] = 0
+        s['dmaMeasUsed'] = 0
+        s['dmaMeasReject'] = 0
+        s['predCloseAgree'] = 0
+        s['predCloseDisagree'] = 0
+        s['dpllFallbackReason'] = 0
+        s['measSource'] = 0
+    # Sector PI synchronizer telemetry (14 bytes, shifted -14)
+    if len(data) >= 200:
+        s['syncErrHR'] = struct.unpack_from('<h', data, 186)[0]
+        s['syncT_hatHR'] = struct.unpack_from('<H', data, 188)[0]
+        s['syncVsReactive'] = struct.unpack_from('<h', data, 190)[0]
+        s['syncMode'] = data[192]
+        s['syncGoodStreak'] = data[193]
+        s['syncMissStreak'] = data[194]
+        s['syncClusterCount'] = data[195]
+        s['syncAccepts'] = struct.unpack_from('<H', data, 196)[0]
+        s['syncMisses'] = struct.unpack_from('<H', data, 198)[0]
+    else:
+        s['syncErrHR'] = 0
+        s['syncT_hatHR'] = 0
+        s['syncVsReactive'] = 0
+        s['syncMode'] = 0
+        s['syncGoodStreak'] = 0
+        s['syncMissStreak'] = 0
+        s['syncClusterCount'] = 0
+        s['syncAccepts'] = 0
+        s['syncMisses'] = 0
+    # V12: icBounce (shifted -14 by gate removal, net 0 from sync add)
+    if len(data) >= 202:
+        s['icBounce'] = struct.unpack_from('<H', data, 200)[0]
+    else:
+        s['icBounce'] = 0
+    # V13: DMA shadow telemetry (24 bytes, net 0 offset shift)
+    if len(data) >= 226:
+        s['dmaStepCount']       = struct.unpack_from('<I', data, 202)[0]
+        s['dmaMatchCount']      = struct.unpack_from('<I', data, 206)[0]
+        s['dmaRingOverflow']    = struct.unpack_from('<I', data, 210)[0]
+        s['dmaEdgesAvgX16']     = struct.unpack_from('<H', data, 214)[0]
+        s['dmaEarlyVsPoll']     = struct.unpack_from('<h', data, 216)[0]
+        s['dmaEarlyVsExp']      = struct.unpack_from('<h', data, 218)[0]
+        s['dmaClosestVsExp']    = struct.unpack_from('<h', data, 220)[0]
+        s['dmaPollVsExp']       = struct.unpack_from('<h', data, 222)[0]
+        s['dmaLastEdgeCount']   = data[224]
+        s['dmaLastFound']       = data[225]
+    else:
+        s['dmaStepCount'] = 0
+        s['dmaMatchCount'] = 0
+        s['dmaEdgesAvgX16'] = 0
+        s['dmaRingOverflow'] = 0
+        s['dmaEarlyVsPoll'] = 0
+        s['dmaEarlyVsExp'] = 0
+        s['dmaClosestVsExp'] = 0
+        s['dmaPollVsExp'] = 0
+        s['dmaLastEdgeCount'] = 0
+        s['dmaLastFound'] = 0
+    # V14: DMA-direct substitution counters (18 bytes starting at offset 212)
+    # Fields: subCount (u32), subSkipGated (u32), subSkipRange (u32),
+    #         lastCorrectionHR (i16), minCorrectionHR (i16),
+    #         maxCorrectionHR (i16)
+    if len(data) >= 244:
+        s['dmaSubCount']        = struct.unpack_from('<I', data, 226)[0]
+        s['dmaSubSkipGated']    = struct.unpack_from('<I', data, 230)[0]
+        s['dmaSubSkipRange']    = struct.unpack_from('<I', data, 234)[0]
+        s['dmaLastCorrectionHR'] = struct.unpack_from('<h', data, 238)[0]
+        s['dmaMinCorrectionHR']  = struct.unpack_from('<h', data, 240)[0]
+        s['dmaMaxCorrectionHR']  = struct.unpack_from('<h', data, 242)[0]
+    else:
+        s['dmaSubCount'] = 0
+        s['dmaSubSkipGated'] = 0
+        s['dmaSubSkipRange'] = 0
+        s['dmaLastCorrectionHR'] = 0
+        s['dmaMinCorrectionHR'] = 0
+        s['dmaMaxCorrectionHR'] = 0
     # Derived
     s['iaMa'] = round(s['iaRaw'] * CK_CURRENT_SCALE)
     s['ibMa'] = round(s['ibRaw'] * CK_CURRENT_SCALE)
@@ -180,6 +426,21 @@ def main():
         print("ERROR: No PING response")
         return
 
+    # GET_INFO — print build hash so we can verify which firmware is on the chip
+    ser.write(build_packet(0x01))   # CMD_GET_INFO
+    time.sleep(0.2)
+    info_buf = ser.read(4096)
+    info_pkt, _ = parse_packet(info_buf)
+    if info_pkt and info_pkt[0] == 0x01 and len(info_pkt[1]) >= 24:
+        # GSP_INFO_T V3: 24 bytes ending in u32 buildHash
+        proto_v = info_pkt[1][0]
+        fw_maj, fw_min, fw_pat = info_pkt[1][1], info_pkt[1][2], info_pkt[1][3]
+        if proto_v >= 3:
+            build_hash = struct.unpack_from('<I', info_pkt[1], 20)[0]
+            print(f"  Build hash: 0x{build_hash:08X}  (FW v{fw_maj}.{fw_min}.{fw_pat}, proto v{proto_v})")
+        else:
+            print(f"  FW v{fw_maj}.{fw_min}.{fw_pat}, proto v{proto_v} (no build hash — firmware too old)")
+
     # Start telemetry
     rate_ms = max(10, 1000 // args.rate)
     ser.write(build_packet(CMD_TELEM_START, struct.pack('<H', rate_ms)))
@@ -196,13 +457,32 @@ def main():
     print(f"  Press Ctrl+C to stop")
     print()
     ZC_MODES = ['ACQ', 'TRK', 'RCV']
-    print(f"{'Time':>7s} {'State':>8s} {'ZcM':>3s} {'eRPM':>7s} {'Duty':>4s} {'Pot':>5s} {'Ibus':>7s} {'Vbus':>6s} {'FrcTO':>5s} {'R/F ZC':>10s} {'R/F TO':>10s} {'ZcLat':>6s}")
-    print("-" * 105)
+    SYNC_MODES = ['.', 'S', 'O']  # OFF, SHADOW, OWNED
+    # V4 capture-rate diag columns:
+    #   Cap%  = diagCaptures / sectorCount (Commutate sectors with a cap).
+    #   Bnk%  = adcBlankReject  / total-ADC-fires
+    #   Mis%  = adcStateMismatch/ total-ADC-fires
+    #   R/F   = "rising/falling" capture split ratio, as % of total Set.
+    #           If R/F is ~50/50 the rising-vs-falling polarity hypothesis
+    #           fails and we look elsewhere. If 100/0 or 0/100, one polarity
+    #           class is wholly missing its ZC every commutation.
+    # V5.0 PTG columns: PTG/pR%/pF% (PTG ISR samples)
+    # V5.1 ADC columns: p2R%/p2F% (ADC ISR shadow with post-ZC convention)
+    # V5.2 column:      eTPm (measurement-PI eRPM estimate) — compare to
+    #                   eRpm: if ratio 1.0, measurement tracker is correct
+    #                   (V4 set-point PI sits at eRpm/2, the bug V5.2 fixes).
+    # eRsc column:      host-derived eRpm from delta(sectorCount)/delta(systemTick) × 10.
+    #                   Independent of firmware eRpm formula and eTPm encoding —
+    #                   this is ground truth for Commutate rate.
+    print(f"{'Time':>7s} {'State':>8s} {'eRPM':>7s} {'eRsc':>6s} {'Duty':>4s} {'Vbus':>6s} {'SP':>2s} {'eTP':>6s} {'eTPm':>7s} {'Cap%':>5s} {'Bnk%':>5s} {'Mis%':>5s} {'Set%':>5s} {'R/F%':>7s} {'Fires':>9s} {'OffOK':>7s} {'OffBd':>7s} {'PTG':>8s} {'pR%':>4s} {'pF%':>4s} {'p2R%':>5s} {'p2F%':>5s}")
+    print("-" * 159)
 
     rows = []
     buf = b''
     t0 = time.time()
     sample_count = 0
+    prev_sector_count = None
+    prev_system_tick = None
 
     try:
         while (time.time() - t0) < args.duration:
@@ -247,7 +527,119 @@ def main():
 
                 rfc = f"{snap['risingZcCount']:5d}/{snap['fallingZcCount']:<5d}"
                 rft = f"{snap['risingTimeouts']:5d}/{snap['fallingTimeouts']:<5d}"
-                print(f"{t:7.1f} {state_str:>8s} {zc_mode_str:>3s} {snap['eRpm']:7d} {snap['dutyPct']:3d}% {snap['potRaw']:5d} {snap['ibusMa']:6d}mA {snap['vbusV']:5.1f}V {snap['actualForcedComm']:5d} {rfc:>10s} {rft:>10s} {lat_str:>6s}{fault_str}")
+                lck = 'Y' if snap.get('predLocked', 0) else 'N'
+                gat = 'Y' if snap.get('gateActive', 0) else 'N'
+                locked = snap.get('predLocked', 0)
+                corr = snap.get('dmaLastCorrectionHR', 0)
+                serr = snap.get('syncErrHR', 0)
+                sthat = snap.get('syncT_hatHR', 0)
+                svr = snap.get('syncVsReactive', 0)
+                smode = snap.get('syncMode', 0)
+                sgood = snap.get('syncGoodStreak', 0)
+                sacc = snap.get('syncAccepts', 0)
+                sm_str = SYNC_MODES[smode] if smode < len(SYNC_MODES) else '?'
+                capv = snap.get('syncVsReactive', 0)  # repurposed: carries capValueHR
+                if snap.get('blockComm', 0):
+                    sp_str = 'BLK'
+                elif snap.get('spMode', 0):
+                    sp_str = 'SP '
+                elif snap.get('spRequest', 0):
+                    sp_str = 'RQ '
+                else:
+                    sp_str = '   '
+                etp = snap.get('erpmTP', 0)
+                # Capture acceptance ratio at the Commutate side:
+                # diagCaptures / sectorCount. icAccepted=diagCaptures,
+                # goodZc=sectorCount low 16 bits (total Commutates).
+                # NOT diagPiRuns — that increments on the SAME condition as
+                # diagCaptures (capValue != SENTINEL), so the ratio would
+                # always be 100%. sectorCount is bumped every Commutate
+                # regardless of capture outcome → honest denominator.
+                # 16-bit wraps at 1700 comm/s → 38s; ratio stays meaningful
+                # over a few-second window, absolute counts can drift.
+                _acc = snap.get('icAccepted', 0)
+                _sec = snap.get('goodZc', 0)
+                cap_pct = (100 * _acc // _sec) if _sec > 0 else 0
+                # ADC diagnostic counters are uint32. Show as % of total
+                # ADC fires for Bnk/Mis/Set (steady-state ratios). R/F shows
+                # rising-vs-falling capture split, as % of total Set.
+                bnk = snap.get('adcBlankReject', 0)
+                mis = snap.get('adcStateMismatch', 0)
+                cset = snap.get('adcCaptureSet', 0)
+                cset_r = snap.get('adcSetRising', 0)
+                cset_f = snap.get('adcSetFalling', 0)
+                # "Fires" here is an ADC-fire estimate. With Als dropped from
+                # telemetry the exact total isn't available; approximate as
+                # Bnk+Mis+Set. This understates by the Als count (ADC fires
+                # skipped between a Set and the Commutate consume) — real
+                # total is higher, but Bnk%/Mis%/Set% ratios are still valid
+                # relative to each other.
+                fires_approx = bnk + mis + cset
+                if fires_approx > 0:
+                    bnk_pct = 100 * bnk / fires_approx
+                    mis_pct = 100 * mis / fires_approx
+                    set_pct = 100 * cset / fires_approx
+                else:
+                    bnk_pct = mis_pct = set_pct = 0.0
+                if cset > 0:
+                    rising_pct = 100 * cset_r / cset
+                else:
+                    rising_pct = 0
+                falling_pct = 100 - rising_pct if cset > 0 else 0
+                rf_s = f"{rising_pct:2.0f}/{falling_pct:2.0f}"
+                # Format Fires compactly: 1234, 12.3k, 1.23M, 12.3M
+                if fires_approx >= 1_000_000:
+                    fires_s = f"{fires_approx/1_000_000:.2f}M"
+                elif fires_approx >= 10_000:
+                    fires_s = f"{fires_approx/1000:.1f}k"
+                else:
+                    fires_s = f"{fires_approx}"
+                offok = snap.get('offMidCapture', 0)
+                offbd = snap.get('offMidMismatch', 0)
+                offok_s = f"{offok/1000:.1f}k" if offok >= 10000 else f"{offok}"
+                offbd_s = f"{offbd/1000:.1f}k" if offbd >= 10000 else f"{offbd}"
+                ptg = snap.get('ptgFires', 0)
+                if ptg >= 1_000_000:
+                    ptg_s = f"{ptg/1_000_000:.2f}M"
+                elif ptg >= 10_000:
+                    ptg_s = f"{ptg/1000:.1f}k"
+                else:
+                    ptg_s = f"{ptg}"
+                pr_acc = snap.get('ptgRisingAcc', 0)
+                pr_rej = snap.get('ptgRisingRej', 0)
+                pf_acc = snap.get('ptgFallingAcc', 0)
+                pf_rej = snap.get('ptgFallingRej', 0)
+                pr_pct = (100 * pr_acc / (pr_acc + pr_rej)) if (pr_acc + pr_rej) > 0 else 0
+                pf_pct = (100 * pf_acc / (pf_acc + pf_rej)) if (pf_acc + pf_rej) > 0 else 0
+                # V5.1 ADC post-ZC shadow rates
+                p2r_acc = snap.get('postZcRisingAcc', 0)
+                p2r_rej = snap.get('postZcRisingRej', 0)
+                p2f_acc = snap.get('postZcFallingAcc', 0)
+                p2f_rej = snap.get('postZcFallingRej', 0)
+                p2r_pct = (100 * p2r_acc / (p2r_acc + p2r_rej)) if (p2r_acc + p2r_rej) > 0 else 0
+                p2f_pct = (100 * p2f_acc / (p2f_acc + p2f_rej)) if (p2f_acc + p2f_rej) > 0 else 0
+                # V5.2 measurement-PI eRPM equivalent
+                tMeas = snap.get('tMeasHR', 0)
+                etpm  = (15625000 // tMeas) if tMeas > 0 else 0
+                if etpm > 999999: etpm = 999999  # display clamp (6 digits)
+                # Host-derived eRpm from sectorCount delta (independent of
+                # firmware eRpm formula). eRpm = sectors/sec × 10
+                # (= sectors/sec × 60/6 since 6 sectors per electrical rev).
+                sc_now = snap.get('sectorCountFull', 0)
+                st_now = snap.get('systemTick', 0)  # ms
+                if prev_sector_count is not None and prev_system_tick is not None:
+                    dsc = (sc_now - prev_sector_count) & 0xFFFFFFFF
+                    dst_ms = (st_now - prev_system_tick) & 0xFFFFFFFF
+                    if dst_ms > 0 and dsc < 0x80000000:
+                        ersc = int(dsc * 10000 / dst_ms)  # sectors/sec × 10
+                    else:
+                        ersc = 0
+                else:
+                    ersc = 0
+                prev_sector_count = sc_now
+                prev_system_tick = st_now
+                if ersc > 999999: ersc = 999999
+                print(f"{t:7.1f} {state_str:>8s} {snap['eRpm']:7d} {ersc:6d} {snap['dutyPct']:3d}% {snap['vbusV']:5.1f}V {sp_str:>2s} {etp:6d} {etpm:7d} {cap_pct:4d}% {bnk_pct:4.0f}% {mis_pct:4.0f}% {set_pct:4.0f}% {rf_s:>7s} {fires_s:>9s} {offok_s:>7s} {offbd_s:>7s} {ptg_s:>8s} {pr_pct:3.0f}% {pf_pct:3.0f}% {p2r_pct:4.0f}% {p2f_pct:4.0f}%{fault_str}")
 
                 rows.append({
                     'time': round(t, 3),
@@ -261,8 +653,8 @@ def main():
                     'ib_mA': snap['ibMa'],
                     'vbus_V': snap['vbusV'],
                     'zc_synced': 1 if snap['zcSynced'] else 0,
-                    'missed': snap['missed'],
-                    'forced': snap['forced'],
+                    'missed': snap.get('spBits', 0),
+                    'forced': snap.get('erpmTP', 0),
                     'step_period': snap['stepPeriod'],
                     'step_period_hr': snap['stepPeriodHR'],
                     'filter_level': snap['filterLevel'],
@@ -292,6 +684,99 @@ def main():
                     'polls_0': snap['stepPolls0'], 'polls_1': snap['stepPolls1'],
                     'polls_2': snap['stepPolls2'], 'polls_3': snap['stepPolls3'],
                     'polls_4': snap['stepPolls4'], 'polls_5': snap['stepPolls5'],
+                    'raw_veto': snap['rawVetoCount'],
+                    'ic_age_reject': snap['icAgeRejectCount'],
+                    'track_fallback': snap['trackFallbackCount'],
+                    'raw_stable_block': snap['rawStableBlock'],
+                    'ts_from_ic': snap['tsFromIc'],
+                    'ts_from_raw': snap['tsFromRaw'],
+                    'ts_from_clc': snap['tsFromClc'],
+                    'ts_from_poll': snap['tsFromPoll'],
+                    'ic_lead_reject': snap['icLeadReject'],
+                    'target_past': snap['targetPastCount'],
+                    'sched_margin_hr': snap['schedMarginHR'],
+                    'pred_phase_err_hr': snap.get('predPhaseErrHR', 0),
+                    'pred_phase_err_rx_hr': snap.get('predPhaseErrRxHR', 0),
+                    'pred_step_hr': snap.get('predStepHR', 0),
+                    'pred_real_zc_delay_hr': snap.get('predRealZcDelayHR', 0),
+                    'pred_zc_in_window': snap.get('predZcInWindow', 0),
+                    'pred_zc_out_window': snap.get('predZcOutWindow', 0),
+                    'pred_locked': snap.get('predLocked', 0),
+                    'pred_miss_count': snap.get('predMissCount', 0),
+                    'pred_min_margin_hr': snap.get('predMinMarginHR', 0),
+                    'pred_zc_offset_hr': snap.get('predZcOffsetHR', 0),
+                    'win_cand_in_gated': snap.get('winCandInGated', 0),
+                    'win_cand_out_gated': snap.get('winCandOutGated', 0),
+                    'win_out_early': snap.get('winOutEarly', 0),
+                    'win_out_late': snap.get('winOutLate', 0),
+                    'gate_active': snap.get('gateActive', 0),
+                    'window_reject': snap.get('windowReject', 0),
+                    'window_recovered': snap.get('windowRecovered', 0),
+                    'pred_comm_owned': snap.get('predCommOwned', 0),
+                    'predictive_mode': snap.get('predictiveMode', 0),
+                    'pred_exit_miss': snap.get('predExitMiss', 0),
+                    'pred_exit_timeout': snap.get('predExitTimeout', 0),
+                    'pred_vs_reactive_delta': snap.get('predVsReactiveDelta', 0),
+                    'delta_ok_count': snap.get('deltaOkCount', 0),
+                    'handoff_pending': snap.get('handoffPending', 0),
+                    'entry_score': snap.get('entryScore', 0),
+                    'pred_enter': snap.get('predEnter', 0),
+                    'pred_entry_late': snap.get('predEntryLate', 0),
+                    'pred_isr_fired': snap.get('predIsrFired', 0),
+                    'pred_isr_entries': snap.get('predIsrEntries', 0),
+                    'ic_bounce': snap.get('icBounce', 0),
+                    'dma_step_count': snap.get('dmaStepCount', 0),
+                    'dma_match_count': snap.get('dmaMatchCount', 0),
+                    'dma_edges_avg_x16': snap.get('dmaEdgesAvgX16', 0),
+                    'dma_ring_overflow': snap.get('dmaRingOverflow', 0),
+                    'dma_early_vs_poll': snap.get('dmaEarlyVsPoll', 0),
+                    'dma_early_vs_exp': snap.get('dmaEarlyVsExp', 0),
+                    'dma_closest_vs_exp': snap.get('dmaClosestVsExp', 0),
+                    'dma_poll_vs_exp': snap.get('dmaPollVsExp', 0),
+                    'dma_last_edge_count': snap.get('dmaLastEdgeCount', 0),
+                    'dma_last_found': snap.get('dmaLastFound', 0),
+                    'dma_sub_count': snap.get('dmaSubCount', 0),
+                    'dma_sub_correction_hr': snap.get('dmaLastCorrectionHR', 0),
+                    'dma_min_correction_hr': snap.get('dmaMinCorrectionHR', 0),
+                    'dma_max_correction_hr': snap.get('dmaMaxCorrectionHR', 0),
+                    'dpll_phase_bias_hr': snap.get('dpllPhaseBiasHR', 0),
+                    'dpll_err_hr': snap.get('dpllErrHR', 0),
+                    'dma_meas_used': snap.get('dmaMeasUsed', 0),
+                    'dma_meas_reject': snap.get('dmaMeasReject', 0),
+                    'pred_close_agree': snap.get('predCloseAgree', 0),
+                    'pred_close_disagree': snap.get('predCloseDisagree', 0),
+                    'dpll_fallback_reason': snap.get('dpllFallbackReason', 0),
+                    'meas_source': snap.get('measSource', 0),
+                    'pred_phase_err_hr': snap.get('predPhaseErrHR', 0),
+                    'pred_locked': snap.get('predLocked', 0),
+                    'pred_step_hr': snap.get('predStepHR', 0),
+                    'sync_err_hr': snap.get('syncErrHR', 0),
+                    'sync_t_hat_hr': snap.get('syncT_hatHR', 0),
+                    'sync_vs_reactive': snap.get('syncVsReactive', 0),
+                    'sync_mode': snap.get('syncMode', 0),
+                    'sync_good_streak': snap.get('syncGoodStreak', 0),
+                    'sync_miss_streak': snap.get('syncMissStreak', 0),
+                    'sync_cluster_count': snap.get('syncClusterCount', 0),
+                    'sync_accepts': snap.get('syncAccepts', 0),
+                    'sync_misses': snap.get('syncMisses', 0),
+                    # V4 capture-rate diag (uint32 raw counts).
+                    'adc_blank_reject':  snap.get('adcBlankReject', 0),
+                    'adc_state_mismatch': snap.get('adcStateMismatch', 0),
+                    'adc_capture_set':   snap.get('adcCaptureSet', 0),
+                    'adc_set_rising':    snap.get('adcSetRising', 0),
+                    'adc_set_falling':   snap.get('adcSetFalling', 0),
+                    'off_mid_capture':   snap.get('offMidCapture', 0),
+                    'off_mid_mismatch':  snap.get('offMidMismatch', 0),
+                    'ptg_fires':         snap.get('ptgFires', 0),
+                    'ptg_rising_acc':    snap.get('ptgRisingAcc', 0),
+                    'ptg_rising_rej':    snap.get('ptgRisingRej', 0),
+                    'ptg_falling_acc':   snap.get('ptgFallingAcc', 0),
+                    'ptg_falling_rej':   snap.get('ptgFallingRej', 0),
+                    'post_zc_rising_acc':  snap.get('postZcRisingAcc', 0),
+                    'post_zc_rising_rej':  snap.get('postZcRisingRej', 0),
+                    'post_zc_falling_acc': snap.get('postZcFallingAcc', 0),
+                    'post_zc_falling_rej': snap.get('postZcFallingRej', 0),
+                    't_meas_hr':           snap.get('tMeasHR', 0),
                 })
 
             time.sleep(0.01)

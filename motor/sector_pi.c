@@ -161,7 +161,20 @@ volatile uint32_t diagCommutateNoCapture;
  * sectors with a valid corridor capture. */
 #define CORRIDOR_GOOD_THRESHOLD  12
 static uint8_t corridorGoodStreak = 0;
+static uint8_t corridorMissStreak = 0;     /* consecutive sentinels — block-comm exit */
 static bool piEnabled = false;        /* PI error: capValue - setValue */
+
+
+/* Stability counter for block-comm entry — incremented every TimeTick
+ * (1 kHz) while eRPM ≥ 150k. Cleared when speed drops. */
+static uint16_t blockCommStableTicks = 0;
+
+/* Block-comm exit cooldown — counts speed-windows (20 ms each).
+ * After exit, prevents re-entry until the motor settles on PWM,
+ * which kills the BLK↔PWM thrashing seen on small pot jitter at
+ * the entry threshold (each toggle is a 100%↔88% drive perturbation
+ * that disturbs the BEMF measurement and can cascade into desync). */
+static uint16_t blockExitCooldown = 0;
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -225,6 +238,7 @@ static void EnterCL(void)
     diagPiRuns = 0;
     diagLastCapValue = 0xFFFF;
     corridorGoodStreak = 0;
+    corridorMissStreak = 0;
     piEnabled = false;
 
     targetPeriod = timerPeriod;
@@ -690,7 +704,17 @@ void SectorPI_Commutate(void)
          * In SP mode, extend past pulse turn-off + 10µs settle. */
         uint16_t sectorHR = (actualStepPeriodHR >= V4_MIN_PERIOD)
                             ? actualStepPeriodHR : timerPeriod;
-        uint16_t blankHR = sectorHR >> 2;
+        /* Runtime blanking (V4 Commutate ISR) — was hardcoded `>> 2`
+         * (25%), ignoring v4Params.blankingPct.  Wired up 2026-04-28
+         * so SET_PARAM 0xF3 actually takes effect.  Fallback to 25%
+         * if pct is zero or out of range. */
+        uint8_t  blankPct = v4Params.blankingPct;
+        uint16_t blankHR;
+        if (blankPct == 0U || blankPct > 100U) {
+            blankHR = sectorHR >> 2;   /* safe fallback */
+        } else {
+            blankHR = (uint16_t)(((uint32_t)sectorHR * blankPct) / 100U);
+        }
         if (v4_spActive)
         {
             uint16_t dutyHR = (uint16_t)(((uint32_t)actualAmplitude
@@ -749,14 +773,20 @@ void SectorPI_Commutate(void)
     _CCP2IE = 1;
     _CCP5IE = 1;
 
-    /* Track good-capture streak for diagnostics */
+    /* Track good-capture streak for diagnostics, and consecutive-miss
+     * streak for block-commutation exit (V4 captures only rising-edge
+     * sectors, so cap rate is naturally ~50% at steady state — counting
+     * misses-in-a-row is a more meaningful "still locked" indicator
+     * than counting consecutive hits). */
     if (capValue != CAP_SENTINEL)
     {
         if (corridorGoodStreak < 255) corridorGoodStreak++;
+        corridorMissStreak = 0;
     }
     else
     {
         corridorGoodStreak = 0;
+        if (corridorMissStreak < 255) corridorMissStreak++;
     }
 
     /* Reactive scheduling — IIR + reactive from first valid capture.
@@ -810,15 +840,35 @@ void SectorPI_Commutate(void)
             v4_timerPeriod = timerPeriod;  /* expose for CCP ISR */
         }
 
-        /* Reactive target: ZC timestamp + halfPeriod - advance.
-         * TAL=2 (15°) at low speed for stable startup.
-         * TAL=3 (22.5°) above 60k eRPM for high-speed margin.
-         * 60k eRPM = 15.6M/60000 = 260 ticks. */
+        /* Reactive target: ZC timestamp + delay-to-next-commutation.
+         *
+         * Speed-adaptive advance (proven 196k baseline):
+         *   schedPeriod >= 260 HR (≤60k eRPM): TAL=2 → 15° advance
+         *   schedPeriod <  260 HR (>60k eRPM): TAL=3 → 22.5° advance
+         *
+         * The 2026-04-28 unification (using v4Derived.advancePlus30Fp8
+         * for both PI and scheduler) removed this ramp and motor walled
+         * at 130k.  Restored: PI's setValue stays at fixed 15° (its own
+         * model); scheduler keeps speed-adaptive ramp. */
         uint16_t schedPeriod = v4_spActive ? actualStepPeriodHR : timerPeriod;
         uint16_t halfHR = schedPeriod >> 1;
-        uint16_t tal = (schedPeriod < 260) ? 3 : 2;
-        uint16_t advHR = (schedPeriod >> 3) * tal;
-        uint16_t delayHR = (halfHR > advHR) ? (halfHR - advHR) : 2;
+        /* Speed-adaptive TAL ramp:
+         *   schedPeriod >= 260 HR (≤60k eRPM):  TAL=2 → 15°
+         *   130-260   (60-120k eRPM):           TAL=3 → 22.5°
+         *   schedPeriod < 130 HR (>120k eRPM):  TAL=4 → 30°
+         * 4th band added 2026-04-28 to push past 178k wall.
+         *
+         * Predicted-scheduling experiment 2026-04-28: tried thisCommHR-
+         * anchored target above 175k for >30° advance. Regressed peak
+         * 195k→178k because timerPeriod saturates at minPeriodHr giving
+         * a bad period estimate. Reverted; current TAL=4 floor at 195k
+         * may be a real BEMF/timing limit, not a scheduler one. */
+        uint16_t tal;
+        if      (schedPeriod >= 260U) tal = 2U;
+        else if (schedPeriod >= 130U) tal = 3U;
+        else                          tal = 4U;
+        uint16_t advHR  = (uint16_t)((schedPeriod >> 3) * tal);
+        uint16_t delayHR = (halfHR > advHR) ? (uint16_t)(halfHR - advHR) : 2U;
         uint16_t targetHR = (uint16_t)(v4_lastCaptureHR + delayHR);
 
         diagDelta = (int16_t)(targetHR - thisCommHR);  /* margin */
@@ -946,6 +996,53 @@ void SectorPI_TimeTick(void)
         {
             v4_spRequest = false;
         }
+
+        /* Block-commutation auto-engagement (Option A: duty saturation).
+         * At ≥95% Q15 the PWM is already clipping near the period cap,
+         * so further "switching" gives no torque headroom. Override the
+         * active phase H gate solid-ON for the whole sector — no PWM
+         * chopping. Equivalent to infinite switching frequency.
+         *
+         * V4 captures rising-edge sectors only — falling sectors return
+         * CAP_SENTINEL by design — so corridorGoodStreak alternates near
+         * 1 even at perfect lock. The first version gated entry on
+         * `goodStreak > 50`, which was unreachable. Replaced with a
+         * "stable at speed" gauge (10 speed-windows × 20 ms = 200 ms
+         * above 150k) for entry, and the inverse `corridorMissStreak`
+         * (consecutive sentinels) for the exit lock-loss check. */
+        if (erpm >= V4_BLOCK_ENTER_ERPM)
+        {
+            if (blockCommStableTicks < 0xFFFFu) blockCommStableTicks++;
+        }
+        else
+        {
+            blockCommStableTicks = 0;
+        }
+
+        if (blockExitCooldown > 0U) blockExitCooldown--;
+
+        if (g_blockCommActive)
+        {
+            if (actualAmplitude < 29490U                 /* < 90% Q15 */
+                || erpm < V4_BLOCK_EXIT_ERPM
+                || corridorMissStreak > 5U)
+            {
+                g_blockCommActive = false;
+                blockExitCooldown = 25U;                 /* 500 ms re-entry lockout */
+            }
+        }
+        else
+        {
+            if (actualAmplitude >= 31130U                /* ≥ 95% Q15 */
+                && erpm >= V4_BLOCK_ENTER_ERPM
+                && blockCommStableTicks >= 10U           /* ≥ 200 ms above enter eRPM */
+                && commandEnabled
+                && !v4_spActive
+                && blockExitCooldown == 0U)
+            {
+                g_blockCommActive = true;
+            }
+        }
     }
 
     /* Pot→duty direct. Reactive scheduling in Commutate handles
@@ -968,7 +1065,16 @@ void SectorPI_TimeTick(void)
     }
 }
 
-#define V4_MIN_AMPLITUDE  4000U  /* ~12% duty — enough BEMF at CL entry */
+#ifdef V4_MIN_AMPLITUDE_PROFILE
+#define V4_MIN_AMPLITUDE  V4_MIN_AMPLITUDE_PROFILE   /* per-profile override (e.g. HiZ1460) */
+#else
+#define V4_MIN_AMPLITUDE  5000U  /* ~15.3% duty — bumped from 4000 (12.2%) on
+                                  * 2026-04-29 because at 60 kHz the per-cycle
+                                  * switching overhead eats more of the shorter
+                                  * 16.7µs cycle, so 12.2% Q15 only delivers
+                                  * ~10% effective. Empirical desync threshold
+                                  * was ~12% commanded; 15.3% gives margin. */
+#endif
 
 void SectorPI_CommandSet(uint16_t amplitude)
 {
